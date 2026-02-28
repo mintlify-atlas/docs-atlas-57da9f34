@@ -1,0 +1,272 @@
+---
+title: Network lockdown
+description: Install Tailscale, harden SSH, and configure UFW firewall for zero-trust access
+---
+
+This guide covers `02_network.sh`, which establishes zero-trust networking by restricting SSH to Tailscale and blocking all public ports with UFW.
+
+## Prerequisites
+
+- Completed [base system setup](/setup/base-system)
+- Active Tailscale account
+- SSH access as non-root user (e.g., `deploy`)
+
+<Warning>
+This script will lock SSH to Tailscale-only access. Make sure you understand the implications before proceeding.
+</Warning>
+
+## Overview
+
+The network lockdown establishes three layers of security:
+
+1. **Tailscale VPN**: Private mesh network for administrative access
+2. **SSH hardening**: SSH restricted to Tailscale IP range only
+3. **UFW firewall**: All incoming traffic blocked except Tailscale
+
+## Configuration
+
+<Steps>
+
+<Step title="Run the network lockdown script">
+
+Execute as root or with sudo:
+
+```bash
+sudo bash ~/setup/02_network.sh
+```
+
+</Step>
+
+<Step title="Install and authenticate Tailscale">
+
+The script installs Tailscale from the official repository:
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+systemctl enable --now tailscaled
+```
+
+You'll be prompted to choose an authentication method:
+
+**Option 1: Interactive (recommended for first-time setup)**
+
+A URL will be displayed. Open it in a browser to authenticate:
+
+```bash
+tailscale up
+```
+
+**Option 2: Pre-generated auth key**
+
+Generate a reusable key at https://login.tailscale.com/admin/settings/keys:
+
+```bash
+tailscale up --authkey=tskey-auth-...
+```
+
+<Info>
+Auth keys are useful for automation or if you're setting up multiple servers.
+</Info>
+
+Once connected, the script displays your Tailscale IP:
+
+```
+Connected: 100.x.y.z
+```
+
+</Step>
+
+<Step title="Disable key expiry">
+
+By default, Tailscale keys expire after 180 days. The script prompts you to disable expiry:
+
+1. Go to https://login.tailscale.com/admin/machines
+2. Find your server (hostname will match)
+3. Click **⋯** → **Disable key expiry**
+
+<Warning>
+If the key expires, you'll lose SSH access since the server is locked to Tailscale.
+</Warning>
+
+</Step>
+
+<Step title="Verify Tailscale SSH before lockdown">
+
+Before restricting SSH, verify Tailscale connectivity works:
+
+```bash
+ssh deploy@100.x.y.z
+```
+
+Replace `100.x.y.z` with your Tailscale IP from the previous step.
+
+<Warning>
+Do not proceed unless Tailscale SSH is working. Once locked down, you cannot access the server via its public IP.
+</Warning>
+
+</Step>
+
+<Step title="SSH hardening">
+
+The script creates `/etc/ssh/sshd_config.d/99-hardening.conf` with strict security settings:
+
+```conf
+AllowUsers *@100.64.0.0/10
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+MaxAuthTries 3
+LoginGraceTime 30
+ClientAliveInterval 300
+ClientAliveCountMax 2
+MaxSessions 3
+X11Forwarding no
+AllowTcpForwarding no
+AllowAgentForwarding no
+PermitTunnel no
+```
+
+Key restrictions:
+
+- **AllowUsers *@100.64.0.0/10**: Only Tailscale IP range (100.64.0.0/10) can connect
+- **PermitRootLogin no**: Root cannot SSH (even via Tailscale)
+- **PasswordAuthentication no**: Key-based authentication only
+- **AllowTcpForwarding no**: Prevents SSH tunneling abuse
+
+<Note>
+The original `sshd_config` is backed up to `/etc/ssh/sshd_config.backup` before modifications.
+</Note>
+
+SSH is restarted to apply the configuration:
+
+```bash
+systemctl restart ssh
+```
+
+</Step>
+
+<Step title="UFW firewall configuration">
+
+UFW is configured to deny all incoming traffic except Tailscale:
+
+```bash
+apt install -y ufw
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow in on tailscale0
+ufw allow 41641/udp comment "Tailscale WireGuard"
+ufw enable
+```
+
+Rules breakdown:
+
+| Rule | Purpose |
+|------|--------|
+| `deny incoming` | Block all incoming connections by default |
+| `allow outgoing` | Allow all outbound traffic |
+| `allow in on tailscale0` | Allow all traffic on Tailscale interface |
+| `allow 41641/udp` | Tailscale's WireGuard port for mesh connectivity |
+
+<Info>
+Port 41641 is Tailscale's default WireGuard port. It must be reachable from the internet for Tailscale to function.
+</Info>
+
+</Step>
+
+</Steps>
+
+## Verification
+
+After the script completes, verify the lockdown:
+
+```bash
+# Should fail (no response or timeout)
+ssh deploy@YOUR_PUBLIC_IP
+
+# Should work
+ssh deploy@100.x.y.z
+
+# Check UFW status
+sudo ufw status verbose
+
+# Check Tailscale connection
+tailscale status
+```
+
+## Network architecture
+
+After this script:
+
+```
+Public Internet ──╳──> SSH (blocked by UFW)
+                 ╳
+                 └──> UDP 41641 (Tailscale WireGuard) ──> tailscaled
+
+Tailscale mesh ───> tailscale0 interface ──> SSH, all services
+```
+
+- Public IP: All TCP ports blocked (SSH, HTTP, HTTPS)
+- Tailscale IP: Full access to SSH and services
+
+## Hetzner Cloud Firewall
+
+UFW provides host-based firewall protection. For additional security, configure Hetzner's Cloud Firewall:
+
+1. Go to Hetzner Cloud Console → Firewalls
+2. Create a new firewall
+3. Add rules:
+   - **Allow**: UDP port 41641 from 0.0.0.0/0 (Tailscale)
+   - **Deny**: All other inbound traffic
+4. Attach the firewall to your server
+
+<Tip>
+Hetzner's Cloud Firewall operates at the network edge, before traffic even reaches your server. It provides defense-in-depth.
+</Tip>
+
+## Troubleshooting
+
+### Locked out after SSH hardening
+
+If you can't connect via Tailscale:
+
+1. Access the server via Hetzner Cloud Console (VNC)
+2. Edit `/etc/ssh/sshd_config.d/99-hardening.conf`
+3. Temporarily comment out `AllowUsers` line
+4. Restart SSH: `systemctl restart ssh`
+5. Fix Tailscale, then restore the restriction
+
+### Tailscale not connecting
+
+Check the daemon status:
+
+```bash
+sudo systemctl status tailscaled
+sudo journalctl -u tailscaled -n 50
+```
+
+Verify UDP 41641 is not blocked by Hetzner Cloud Firewall.
+
+### UFW blocking Tailscale
+
+If Tailscale traffic is blocked:
+
+```bash
+sudo ufw status numbered
+sudo ufw allow in on tailscale0
+```
+
+## Files modified
+
+| File | Purpose |
+|------|--------|
+| `/etc/ssh/sshd_config.d/99-hardening.conf` | SSH restrictions |
+| `/etc/ssh/sshd_config.backup` | Original SSH config backup |
+| `/etc/ufw/user.rules` | UFW firewall rules |
+
+## Next steps
+
+Set up the Hetzner Cloud Firewall as described above, then proceed to install Dokploy:
+
+```bash
+sudo bash ~/setup/03_dokploy.sh
+```

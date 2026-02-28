@@ -1,0 +1,813 @@
+---
+title: Troubleshooting
+description: Solutions to common issues with your zero-trust VPS deployment platform
+---
+
+## Connection issues
+
+### Locked out of SSH
+
+**Symptom**: Cannot SSH into the server after running the network lockdown script.
+
+**Solution**:
+
+<Steps>
+  <Step title="Access via Hetzner VNC console">
+    1. Log into [console.hetzner.cloud](https://console.hetzner.cloud)
+    2. Select your server
+    3. Click **VNC Console** or **Console** button
+    4. Log in as your deploy user (not root)
+  </Step>
+
+  <Step title="Check Tailscale status">
+    ```bash
+    sudo tailscale status
+    ```
+    
+    If not connected:
+    ```bash
+    sudo tailscale up
+    ```
+  </Step>
+
+  <Step title="Get Tailscale IP">
+    ```bash
+    tailscale ip -4
+    ```
+    
+    Use this IP to reconnect via SSH:
+    ```bash
+    ssh <user>@<tailscale-ip>
+    ```
+  </Step>
+
+  <Step title="Verify SSH configuration">
+    ```bash
+    sudo sshd -T | grep -E "permitrootlogin|passwordauthentication|allowusers"
+    ```
+    
+    Should show:
+    - `permitrootlogin no`
+    - `passwordauthentication no`
+    - `allowusers` with your username and Tailscale network
+  </Step>
+</Steps>
+
+<Warning>
+Never close your current SSH session until you've verified Tailscale SSH works from a different terminal. This prevents complete lockout.
+</Warning>
+
+### Dashboard not loading
+
+**Symptom**: `https://dokploy.yourdomain.com` times out or shows connection error.
+
+**Diagnosis**:
+
+<Accordion title="Check if Dokploy service is running">
+  ```bash
+  docker service ls | grep dokploy
+  ```
+  
+  Expected output:
+  ```
+  ID             NAME               MODE         REPLICAS   IMAGE
+  abc123...      dokploy            replicated   1/1        dokploy/dokploy:latest
+  def456...      dokploy-postgres   replicated   1/1        postgres:15
+  ghi789...      dokploy-redis      replicated   1/1        redis:7
+  ```
+  
+  If any service shows `0/1` replicas:
+  ```bash
+  docker service logs dokploy
+  ```
+  
+  Check for errors and restart:
+  ```bash
+  sudo docker service update --force dokploy
+  ```
+</Accordion>
+
+<Accordion title="Check if cloudflared is running">
+  ```bash
+  docker ps | grep cloudflared
+  ```
+  
+  If not running:
+  ```bash
+  docker logs cloudflared
+  ```
+  
+  Common issues:
+  - Invalid tunnel token
+  - Not connected to `dokploy-network`
+  - Tunnel deleted in Cloudflare dashboard
+  
+  Restart cloudflared:
+  ```bash
+  docker restart cloudflared
+  ```
+  
+  If the tunnel is broken, redeploy via Dokploy with the correct token from Script 4.
+</Accordion>
+
+<Accordion title="Verify Cloudflare tunnel status">
+  1. Go to [one.dash.cloudflare.com](https://one.dash.cloudflare.com)
+  2. Networks → Connectors
+  3. Find your tunnel
+  4. Status should show "Healthy" with a green indicator
+  
+  If unhealthy:
+  - Check cloudflared logs: `docker logs cloudflared`
+  - Verify the tunnel token is correct
+  - Ensure cloudflared is on `dokploy-network`
+</Accordion>
+
+<Accordion title="Check port availability">
+  ```bash
+  ss -tlnp | grep ':3000'
+  ss -tlnp | grep ':80 '
+  ```
+  
+  Both should show listening services. If port 3000 is not listening:
+  ```bash
+  docker service logs dokploy
+  ```
+</Accordion>
+
+### Tailscale connection dropped
+
+**Symptom**: SSH works initially but connection drops or Tailscale goes offline.
+
+**Solution**:
+
+```bash
+# Via VNC console
+sudo systemctl status tailscaled
+sudo systemctl restart tailscaled
+sudo tailscale up
+```
+
+Check for Tailscale service errors:
+```bash
+sudo journalctl -u tailscaled -n 50
+```
+
+<Info>
+Tailscale uses UDP port 41641. Ensure this port is allowed in the Hetzner Cloud Firewall.
+</Info>
+
+## Application deployment issues
+
+### 502 Bad Gateway through Cloudflare
+
+**Symptom**: Application shows 502 error when accessed via public domain.
+
+**Common causes**:
+
+<Accordion title="Port mismatch in Dokploy configuration">
+  **Problem**: The port set in Dokploy's domain configuration doesn't match the port your application actually listens on.
+  
+  **Solution**:
+  1. Check which port your app listens on (e.g., Next.js uses `3000` by default)
+  2. Dokploy → Application → **Domains** tab
+  3. Verify the **Port** field matches your app's listening port
+  4. Redeploy if changed
+</Accordion>
+
+<Accordion title="Application listening on 127.0.0.1 instead of 0.0.0.0">
+  **Problem**: Application binds to localhost only, unreachable from Docker network.
+  
+  **Solution**:
+  
+  Update your application to listen on `0.0.0.0`:
+  
+  **Node.js/Express**:
+  ```javascript
+  app.listen(3000, '0.0.0.0', () => {
+    console.log('Server listening on 0.0.0.0:3000');
+  });
+  ```
+  
+  **Next.js** (usually correct by default):
+  ```json
+  {
+    "scripts": {
+      "start": "next start -H 0.0.0.0"
+    }
+  }
+  ```
+  
+  **Python/Flask**:
+  ```python
+  app.run(host='0.0.0.0', port=5000)
+  ```
+</Accordion>
+
+<Accordion title="Application not running">
+  **Problem**: Container started but application crashed.
+  
+  **Solution**:
+  
+  Check application logs:
+  ```bash
+  # Via Dokploy dashboard
+  Application → Logs tab → Runtime logs
+  ```
+  
+  Or via command line:
+  ```bash
+  docker ps | grep your-app
+  docker logs <container-id>
+  ```
+  
+  Common issues:
+  - Missing environment variables
+  - Database connection errors
+  - Build artifacts not copied correctly
+</Accordion>
+
+<Accordion title="Traefik routing issue">
+  **Problem**: Traefik not correctly routing to the container.
+  
+  **Solution**:
+  
+  Check Traefik logs:
+  ```bash
+  docker service logs dokploy-traefik
+  ```
+  
+  Verify the domain is set correctly in Dokploy (no `https://` prefix, bare domain only).
+  
+  Check if the container is on `dokploy-network`:
+  ```bash
+  docker network inspect dokploy-network
+  ```
+</Accordion>
+
+### Build failures
+
+**Symptom**: Deployment fails during the build phase.
+
+<Accordion title="Next.js build fails">
+  **Problem**: Build fails with Node.js version errors.
+  
+  **Solution**:
+  
+  Add to application environment variables:
+  ```bash
+  NIXPACKS_NODE_VERSION=20
+  ```
+  
+  This is required for new Next.js projects. Without it, Nixpacks may select an incompatible Node.js version.
+</Accordion>
+
+<Accordion title="Out of memory during build">
+  **Problem**: Build process killed due to insufficient memory.
+  
+  **Solution**:
+  
+  1. Check swap is enabled:
+     ```bash
+     swapon --show
+     free -h
+     ```
+  
+  2. If no swap, add it:
+     ```bash
+     sudo fallocate -l 2G /swapfile
+     sudo chmod 600 /swapfile
+     sudo mkswap /swapfile
+     sudo swapon /swapfile
+     ```
+  
+  3. Consider upgrading to a VPS with more RAM for large builds
+</Accordion>
+
+<Accordion title="Dependencies fail to install">
+  **Problem**: Package installation fails during build.
+  
+  **Solution**:
+  
+  Check build logs for specific errors:
+  - Network connectivity issues
+  - Package registry timeouts
+  - Incompatible dependency versions
+  
+  For npm/yarn:
+  ```bash
+  # Set registry explicitly
+  NPM_CONFIG_REGISTRY=https://registry.npmjs.org
+  ```
+  
+  For private packages:
+  - Add authentication tokens to environment variables
+  - Ensure GitHub access tokens have correct permissions
+</Accordion>
+
+### Container won't start
+
+**Symptom**: Deployment succeeds but container exits immediately.
+
+**Diagnosis**:
+
+```bash
+# List all containers, including stopped ones
+docker ps -a | grep your-app
+
+# Check logs of the stopped container
+docker logs <container-id>
+```
+
+**Common causes**:
+
+<Accordion title="Missing environment variables">
+  Application crashes because required environment variables are not set.
+  
+  **Solution**:
+  1. Application → **Environment** tab
+  2. Add all required variables
+  3. Redeploy
+</Accordion>
+
+<Accordion title="Database connection failed">
+  Application can't connect to database.
+  
+  **Solution**:
+  
+  Verify database container is running:
+  ```bash
+  docker ps | grep postgres
+  docker ps | grep mysql
+  ```
+  
+  Test connection from application container:
+  ```bash
+  docker exec -it <app-container> sh
+  nc -zv database-host 5432
+  ```
+  
+  Check connection string format:
+  ```bash
+  # PostgreSQL
+  postgresql://user:password@hostname:5432/database
+  
+  # MySQL
+  mysql://user:password@hostname:3306/database
+  ```
+</Accordion>
+
+<Accordion title="Permission issues">
+  Container user lacks permissions to access mounted volumes.
+  
+  **Solution**:
+  
+  Check volume permissions:
+  ```bash
+  docker volume inspect <volume-name>
+  ```
+  
+  Fix ownership (adjust UID/GID as needed):
+  ```bash
+  docker run --rm -v <volume-name>:/data alpine chown -R 1000:1000 /data
+  ```
+</Accordion>
+
+## Cloudflare issues
+
+### SSL/TLS errors
+
+**Symptom**: ERR_SSL_VERSION_OR_CIPHER_MISMATCH or certificate errors.
+
+**Solution**:
+
+<Steps>
+  <Step title="Check SSL/TLS mode">
+    1. Cloudflare dashboard → your domain
+    2. **SSL/TLS** → Overview
+    3. Ensure set to **Full** (not Full Strict)
+  </Step>
+
+  <Step title="Why Full, not Full Strict?">
+    - Traefik has no certificate inside the tunnel
+    - cloudflared connects to Traefik over plain HTTP within Docker
+    - The tunnel itself is encrypted end-to-end
+    - Full Strict would fail because Traefik doesn't present a valid certificate
+  </Step>
+</Steps>
+
+### Zero Trust blocking legitimate access
+
+**Symptom**: Can't access dashboard even with correct email.
+
+**Solutions**:
+
+<Accordion title="Check Access Application order">
+  Cloudflare evaluates Access Applications in order of specificity.
+  
+  Correct configuration:
+  1. `/api/deploy` with Bypass rule (more specific)
+  2. Root domain with Allow rule (less specific)
+  
+  Verify at: Zero Trust → Access → Applications
+</Accordion>
+
+<Accordion title="Clear Cloudflare cookies">
+  Stale authentication cookies can cause issues.
+  
+  1. Clear browser cookies for `dokploy.yourdomain.com`
+  2. Clear Cloudflare Access cookies: `CF_Authorization*`
+  3. Try accessing in incognito/private mode
+</Accordion>
+
+<Accordion title="Check email matches policy">
+  Zero Trust → Access → Applications → your dashboard policy
+  
+  Ensure your email is listed in the Include rule.
+</Accordion>
+
+### Webhooks not working
+
+**Symptom**: Auto-deploy doesn't trigger on git push.
+
+**Diagnosis**:
+
+<Accordion title="Verify webhook bypass rule">
+  Zero Trust → Access → Applications
+  
+  Ensure you have:
+  - Application domain: `dokploy.yourdomain.com/api/deploy`
+  - Policy: Bypass
+  - Include: Everyone
+  
+  This path MUST bypass authentication for GitHub to reach it.
+</Accordion>
+
+<Accordion title="Check webhook deliveries in GitHub">
+  1. GitHub repository → Settings → Webhooks
+  2. Click on the Dokploy webhook
+  3. Check **Recent Deliveries** tab
+  4. Look for failed deliveries or error responses
+  
+  Common issues:
+  - 403 Forbidden - Bypass rule not configured
+  - 502 Bad Gateway - Dokploy not reachable
+  - Timeout - Cloudflare tunnel down
+</Accordion>
+
+<Accordion title="Verify Server Domain in Dokploy">
+  Dokploy → Settings → WebServer → **Server Domain**
+  
+  Should be: `dokploy.yourdomain.com` (no `https://`)
+  
+  This is used to construct webhook URLs. If incorrect, GitHub can't reach the webhook endpoint.
+</Accordion>
+
+## System issues
+
+### Disk space full
+
+**Symptom**: Deployments fail with "no space left on device" errors.
+
+**Solution**:
+
+<Steps>
+  <Step title="Check disk usage">
+    ```bash
+    df -h
+    docker system df
+    ```
+  </Step>
+
+  <Step title="Clean Docker resources">
+    ```bash
+    # Remove stopped containers
+    docker container prune -f
+    
+    # Remove unused images
+    docker image prune -a -f
+    
+    # Remove build cache
+    docker builder prune -f
+    ```
+  </Step>
+
+  <Step title="Check logs size">
+    ```bash
+    sudo du -sh /var/lib/docker/containers/*/*-json.log
+    ```
+    
+    Configure log rotation in `/etc/docker/daemon.json`:
+    ```json
+    {
+      "log-driver": "json-file",
+      "log-opts": {
+        "max-size": "10m",
+        "max-file": "3"
+      }
+    }
+    ```
+    
+    Restart Docker:
+    ```bash
+    sudo systemctl restart docker
+    ```
+  </Step>
+
+  <Step title="Remove old volumes (careful!)">
+    ```bash
+    # List volumes
+    docker volume ls
+    
+    # Remove specific volume
+    docker volume rm <volume-name>
+    
+    # Or remove all unused volumes
+    docker volume prune -f
+    ```
+    
+    <Warning>
+    This deletes data permanently. Only remove volumes you're certain are unused.
+    </Warning>
+  </Step>
+</Steps>
+
+### High memory usage
+
+**Symptom**: Server becomes slow or unresponsive.
+
+**Diagnosis**:
+
+```bash
+free -h
+htop
+docker stats
+```
+
+**Solution**:
+
+<Accordion title="Identify memory-hungry containers">
+  ```bash
+  docker stats --no-stream --format "table {{.Name}}\t{{.MemUsage}}" | sort -k2 -h
+  ```
+  
+  Set memory limits on problematic containers:
+  
+  Dokploy → Application → **Advanced** tab → **Memory limit**: `512M`
+</Accordion>
+
+<Accordion title="Restart services to free memory">
+  ```bash
+  # Restart specific service
+  sudo docker service update --force dokploy
+  
+  # Restart Docker daemon (careful!)
+  sudo systemctl restart docker
+  ```
+</Accordion>
+
+<Accordion title="Add more swap">
+  If swap is too small:
+  ```bash
+  # Check current swap
+  swapon --show
+  
+  # Increase swap size (example: 4GB)
+  sudo swapoff /swapfile
+  sudo fallocate -l 4G /swapfile
+  sudo mkswap /swapfile
+  sudo swapon /swapfile
+  ```
+</Accordion>
+
+### Services not starting after reboot
+
+**Symptom**: After server restart, Dokploy or applications don't come back up.
+
+**Solution**:
+
+<Steps>
+  <Step title="Check Docker service">
+    ```bash
+    sudo systemctl status docker
+    sudo systemctl start docker
+    sudo systemctl enable docker
+    ```
+  </Step>
+
+  <Step title="Verify Swarm is active">
+    ```bash
+    docker info | grep -A5 Swarm
+    ```
+    
+    If Swarm is inactive:
+    ```bash
+    docker swarm init
+    ```
+  </Step>
+
+  <Step title="Check services">
+    ```bash
+    docker service ls
+    ```
+    
+    If services show `0/1` replicas, check logs:
+    ```bash
+    docker service logs dokploy
+    docker service logs dokploy-postgres
+    ```
+  </Step>
+
+  <Step title="Restart cloudflared if deployed as container">
+    ```bash
+    docker ps -a | grep cloudflared
+    docker start cloudflared
+    ```
+    
+    Ensure restart policy is set:
+    ```yaml
+    restart: unless-stopped
+    ```
+  </Step>
+</Steps>
+
+## Firewall and network issues
+
+### Ports unexpectedly exposed
+
+**Symptom**: Security scan shows open ports that should be blocked.
+
+**Verification**:
+
+```bash
+# Check UFW
+sudo ufw status verbose
+
+# Check listening ports
+ss -tlnp
+
+# External port scan (from another machine)
+nmap -p 1-65535 <your-public-ip>
+```
+
+**Solution**:
+
+<Steps>
+  <Step title="Verify UFW is active">
+    ```bash
+    sudo ufw status
+    ```
+    
+    Should show `Status: active`
+  </Step>
+
+  <Step title="Check Hetzner Cloud Firewall">
+    1. [console.hetzner.cloud](https://console.hetzner.cloud) → Firewalls
+    2. Find your firewall
+    3. Verify only these inbound rules exist:
+       - UDP 41641 (Tailscale)
+       - ICMP (Ping)
+    4. Ensure the firewall is applied to your server
+  </Step>
+
+  <Step title="Remember: Docker bypasses UFW">
+    Docker Swarm manipulates iptables directly and bypasses UFW.
+    
+    The **Hetzner Cloud Firewall** operates at the hypervisor level - Docker cannot bypass it. This is your primary protection.
+  </Step>
+</Steps>
+
+<Important>
+All ports bind to `0.0.0.0` due to Docker Swarm limitations. The Hetzner Cloud Firewall at the hypervisor level blocks all public TCP, so only Tailscale peers can reach them. This is by design.
+</Important>
+
+### Can't access internal services via Tailscale
+
+**Symptom**: Application without a domain set doesn't respond on `http://<tailscale-ip>:<port>`.
+
+**Solution**:
+
+<Accordion title="Verify container is running">
+  ```bash
+  docker ps | grep your-app
+  ```
+</Accordion>
+
+<Accordion title="Check port is listening">
+  ```bash
+  ss -tlnp | grep <port>
+  ```
+  
+  Should show `0.0.0.0:<port>` or `:::<port>`
+</Accordion>
+
+<Accordion title="Test from server itself">
+  ```bash
+  curl http://localhost:<port>
+  ```
+  
+  If this works but Tailscale access doesn't, check UFW:
+  ```bash
+  sudo ufw status | grep tailscale0
+  ```
+  
+  Should show:
+  ```
+  Anywhere on tailscale0         ALLOW       Anywhere
+  ```
+</Accordion>
+
+<Accordion title="Verify Tailscale connectivity">
+  From your local machine:
+  ```bash
+  tailscale ping <tailscale-ip>
+  ```
+  
+  Should show successful ping responses.
+</Accordion>
+
+## Getting help
+
+If you've tried the solutions above and still experiencing issues:
+
+<Steps>
+  <Step title="Gather diagnostic information">
+    ```bash
+    # System info
+    uname -a
+    df -h
+    free -h
+    
+    # Docker info
+    docker version
+    docker info
+    docker service ls
+    docker ps -a
+    
+    # Network
+    sudo ufw status verbose
+    tailscale status
+    ss -tlnp
+    
+    # Logs
+    docker service logs dokploy --tail 100
+    docker logs cloudflared --tail 100
+    ```
+  </Step>
+
+  <Step title="Check project resources">
+    - Review the [source README](https://github.com/marton-harangi/Hetzner-Zero-Trust-VPS)
+    - Check GitHub issues for similar problems
+    - Review setup scripts to understand configuration
+  </Step>
+
+  <Step title="Service-specific documentation">
+    - [Dokploy Docs](https://docs.dokploy.com)
+    - [Cloudflare Tunnel Docs](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/)
+    - [Tailscale Docs](https://tailscale.com/kb/)
+  </Step>
+</Steps>
+
+## Prevention and best practices
+
+<AccordionGroup>
+  <Accordion title="Always test in a separate terminal before closing SSH">
+    When making SSH or network changes, keep your current session open and test from a new terminal before disconnecting.
+  </Accordion>
+
+  <Accordion title="Monitor disk usage regularly">
+    Set up monitoring or check weekly:
+    ```bash
+    df -h
+    docker system df
+    ```
+  </Accordion>
+
+  <Accordion title="Keep regular backups">
+    - Use Hetzner snapshots for full system backups
+    - Back up Docker volumes for application data
+    - Keep configuration files in version control
+  </Accordion>
+
+  <Accordion title="Test deployments in staging first">
+    For production systems, deploy to a test environment before pushing to production.
+  </Accordion>
+
+  <Accordion title="Review logs periodically">
+    Check for warnings or errors even when things seem to work:
+    ```bash
+    docker service logs dokploy --tail 50
+    sudo journalctl -u docker --since "1 hour ago"
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Daily usage" icon="calendar" href="/operations/daily-usage">
+    Return to common management tasks
+  </Card>
+  <Card title="Deploying apps" icon="rocket" href="/operations/deploying-apps">
+    Deploy applications through Dokploy
+  </Card>
+</CardGroup>

@@ -1,0 +1,123 @@
+---
+title: Introduction
+description: Deploy a hardened Dokploy instance on Hetzner with zero-trust security—no open ports, SSH via Tailscale, all traffic via Cloudflare Tunnel
+---
+
+## What is Hetzner Zero Trust VPS?
+
+Hetzner Zero Trust VPS is a set of opinionated bash scripts that turn a fresh Hetzner VPS into a production-ready, zero-trust deployment platform. No open ports. No exposed SSH. No plain-HTTP dashboards. Everything is locked down from the start.
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="diagram-project" href="/architecture">
+    Understand the zero-trust architecture and traffic flow
+  </Card>
+  <Card title="Prerequisites" icon="list-check" href="/prerequisites">
+    What you need before starting the deployment
+  </Card>
+  <Card title="Base system setup" icon="server" href="/setup/base-system">
+    Harden the system and create your deploy user
+  </Card>
+  <Card title="Network lockdown" icon="shield" href="/setup/network-lockdown">
+    Configure Tailscale and secure SSH access
+  </Card>
+</CardGroup>
+
+## Traffic flow
+
+```
+Internet ──► Cloudflare ──► Tunnel ──► Traefik ──► Your apps (domain configured)
+                                               └──► dokploy.yourdomain.com (Zero Trust)
+
+    You ──► Tailscale (100.x.x.x) ──► SSH only
+                                  └──► Your apps (no domain set — Tailscale-only)
+```
+
+<Info>
+Apps without a domain set in Dokploy are **not publicly reachable**. Traefik has no routing rule for them, and all public TCP is blocked at the Hetzner Cloud Firewall. They are only accessible via `http://<tailscale-ip>:<port>` from your Tailscale network—useful for internal tools.
+</Info>
+
+## Security layers
+
+| Layer | Implementation |
+|-------|----------------|
+| **SSH access** | Tailscale only—public SSH port never opened |
+| **App traffic** | Cloudflare Tunnel—no inbound firewall rules needed |
+| **Dashboard** | Cloudflare Zero Trust Access—email-gated login |
+| **Webhooks** | `/api/deploy` bypass rule—GitHub auto-deploy still works |
+| **Kernel** | Hardened sysctl, restricted shared memory |
+| **Docker** | Swarm mode, Hetzner Cloud Firewall blocks all public TCP |
+
+## Platform support
+
+<Note>
+- **OS**: Ubuntu 24.04 (fresh install, SSH key configured)
+- **Architecture**: x86_64 or ARM64
+- **Provider**: Hetzner Cloud VPS
+- **License**: AGPL-3.0
+</Note>
+
+## Quick start
+
+SSH in as root and clone the repo:
+
+```bash
+ssh root@<YOUR_VPS_IP>
+git clone https://github.com/marton-harangi/Hetzner-Zero-Trust-VPS.git ~/setup
+chmod +x ~/setup/*.sh
+```
+
+<Warning>
+All scripts require root privileges. Script 1 runs directly as root. Scripts 2–5 are run as your deploy user using `sudo`, which grants the same root privileges for the duration of the script.
+</Warning>
+
+Run the scripts in order:
+
+1. **Base system** (`01_base.sh`) — System hardening, swap, user creation
+2. **Network lockdown** (`02_network.sh`) — Tailscale, SSH lockdown, UFW
+3. **Install Dokploy** (`03_dokploy.sh`) — Docker, Swarm, Dokploy, timezone
+4. **Cloudflare Tunnel** (`04_cloudflared.sh`) — Tunnel setup and Zero Trust
+5. **Verify** (`05_verify.sh`) — Security audit and cleanup
+
+## Why this approach?
+
+<CardGroup cols={2}>
+  <Card title="No fail2ban needed" icon="ban">
+    SSH is Tailscale-only. Port scanners can't reach it.
+  </Card>
+  <Card title="Hypervisor-level firewall" icon="firewall">
+    Hetzner Cloud Firewall blocks at the hypervisor—Docker can't bypass it.
+  </Card>
+  <Card title="No Docker SSH exceptions" icon="docker">
+    Dokploy uses the Docker socket directly, unlike Coolify.
+  </Card>
+  <Card title="Zero Trust dashboard" icon="lock">
+    Cloudflare Access gates login, webhooks bypass via path rule.
+  </Card>
+</CardGroup>
+
+## Day-to-day operations
+
+**Dashboard**: `https://dokploy.yourdomain.com` — protected by Cloudflare Zero Trust (email login required)
+
+**SSH**: `ssh <user>@<tailscale-ip>` — Tailscale only
+
+**Deploy a new app**:
+1. Create app in Dokploy, add domain `app.yourdomain.com` (bare domain, no `https://`, HTTP only, set container port)
+2. With the wildcard tunnel hostname already in place, that's it—no DNS changes needed
+3. Set timezone: app → **Environment** tab → add `TZ=Europe/Budapest` (containers don't inherit host timezone)
+4. Live at `https://app.yourdomain.com`
+
+<Tip>
+**Auto-deploy on push**: Connect GitHub in Dokploy (Settings → Git Providers → GitHub), create app from repo, toggle Auto Deploy on. GitHub webhooks reach Dokploy through `dokploy.yourdomain.com` via the tunnel (bypassing Zero Trust on `/api/deploy`).
+</Tip>
+
+## Get started
+
+<CardGroup cols={2}>
+  <Card title="Check prerequisites" icon="list-check" href="/prerequisites">
+    Verify you have everything needed
+  </Card>
+  <Card title="Begin setup" icon="play" href="/setup/base-system">
+    Start with the base system configuration
+  </Card>
+</CardGroup>

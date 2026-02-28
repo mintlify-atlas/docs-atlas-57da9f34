@@ -1,0 +1,300 @@
+---
+title: Dokploy installation
+description: Install Docker Swarm and Dokploy with proper timezone configuration
+---
+
+This guide covers `03_dokploy.sh`, which installs Docker, Docker Swarm, and Dokploy, then configures timezone settings for all services.
+
+## Prerequisites
+
+- Completed [network lockdown](/setup/network-lockdown)
+- Tailscale connected and verified
+- Ports 80, 443, and 3000 must be free
+
+## Overview
+
+Dokploy is a self-hosted PaaS (Platform as a Service) that simplifies deployment of applications using Docker Swarm. This script:
+
+- Installs Docker, Docker Swarm, and Dokploy
+- Configures timezone for Dokploy services
+- Verifies the installation
+- Provides access instructions
+
+<Note>
+Dokploy includes Traefik as a reverse proxy for handling HTTP/HTTPS routing to your applications.
+</Note>
+
+## Configuration
+
+<Steps>
+
+<Step title="Run the Dokploy installation script">
+
+Execute as root:
+
+```bash
+sudo bash ~/setup/03_dokploy.sh
+```
+
+The script verifies Tailscale is connected before proceeding:
+
+```bash
+TAILSCALE_IP=$(tailscale ip -4 2>/dev/null)
+[ -z "$TAILSCALE_IP" ] && echo "Tailscale not connected." && exit 1
+```
+
+</Step>
+
+<Step title="Install Dokploy">
+
+The official Dokploy installer is executed:
+
+```bash
+curl -sSL https://dokploy.com/install.sh | sh
+```
+
+This single command:
+- Installs Docker Engine
+- Initializes Docker Swarm mode
+- Deploys Dokploy services (PostgreSQL, Redis, Traefik)
+- Configures the Dokploy dashboard on port 3000
+
+<Info>
+The installation takes 2-5 minutes depending on server speed and network bandwidth.
+</Info>
+
+</Step>
+
+<Step title="Configure timezone for Dokploy services">
+
+Dokploy's installer may reset the system timezone. The script restores the timezone from the backup created in [base system setup](/setup/base-system):
+
+```bash
+if [ -f /etc/setup-timezone ]; then
+  TIMEZONE=$(cat /etc/setup-timezone)
+  timedatectl set-timezone "$TIMEZONE"
+  echo "$TIMEZONE" > /etc/timezone
+fi
+```
+
+After waiting for Docker Swarm services to start, timezone is applied to all Dokploy services:
+
+```bash
+for SVC in dokploy dokploy-postgres dokploy-redis; do
+  docker service update --env-add TZ="$TIMEZONE" "$SVC"
+done
+```
+
+<Warning>
+Deploy your own applications with the `TZ` environment variable set to ensure correct timestamps and scheduled tasks.
+</Warning>
+
+</Step>
+
+<Step title="Verify installation">
+
+The script checks that services are running:
+
+```bash
+# List Docker Swarm services
+docker service ls
+
+# Check listening ports
+ss -tlnp | grep -E ':3000|:80 |:443 '
+```
+
+Expected output:
+
+```
+ID             NAME               MODE         REPLICAS   IMAGE
+xxx            dokploy            replicated   1/1        dokploy/dokploy:latest
+yyy            dokploy-postgres   replicated   1/1        postgres:15
+zzz            dokploy-redis      replicated   1/1        redis:7
+www            dokploy-traefik    replicated   1/1        traefik:latest
+```
+
+Ports in use:
+- **3000**: Dokploy dashboard
+- **80**: Traefik HTTP
+- **443**: Traefik HTTPS (placeholder)
+
+</Step>
+
+<Step title="Access the Dokploy dashboard">
+
+The dashboard is accessible via Tailscale only:
+
+```
+http://100.x.y.z:3000
+```
+
+Replace `100.x.y.z` with your server's Tailscale IP.
+
+<Info>
+The first person to access the dashboard becomes the admin. Create your admin account immediately.
+</Info>
+
+</Step>
+
+<Step title="Create admin account">
+
+1. Open `http://100.x.y.z:3000` from a device on your Tailnet
+2. Enter your admin credentials
+3. Click **Create Account**
+
+<Warning>
+Do NOT configure Let's Encrypt in Dokploy settings. SSL will be handled by Cloudflare Tunnel (next script).
+</Warning>
+
+</Step>
+
+</Steps>
+
+## Port binding behavior
+
+Dokploy uses Docker Swarm, which has a limitation: services bind to `0.0.0.0` (all interfaces) rather than specific IPs.
+
+This means:
+
+```bash
+# Ports are technically listening on the public IP
+$ ss -tlnp | grep :3000
+LISTEN  0.0.0.0:3000  0.0.0.0:*
+```
+
+However, **traffic is blocked by**:
+
+1. **UFW firewall** (configured in script 02)
+2. **Hetzner Cloud Firewall** (manually configured)
+
+<Tip>
+This is why the zero-trust approach is critical. Docker Swarm cannot be configured to bind only to Tailscale IPs, so firewall rules are the only defense.
+</Tip>
+
+## Dokploy architecture
+
+```
+Tailscale (100.x.y.z) ──> Port 3000 ──> Dokploy Dashboard
+                      │
+                      └─> Port 80/443 ──> Traefik ──> Docker containers
+```
+
+Traefik acts as a reverse proxy:
+- Routes incoming HTTP/HTTPS requests to the correct container
+- Supports automatic service discovery via Docker labels
+- Will be connected to Cloudflare Tunnel in the next step
+
+## Docker Swarm services
+
+| Service | Purpose | Port |
+|---------|---------|------|
+| `dokploy` | Main dashboard and API | 3000 |
+| `dokploy-postgres` | Database for Dokploy metadata | 5432 (internal) |
+| `dokploy-redis` | Cache and session storage | 6379 (internal) |
+| `dokploy-traefik` | Reverse proxy for apps | 80, 443 |
+
+## Managing services
+
+```bash
+# List services
+docker service ls
+
+# View logs
+docker service logs dokploy
+docker service logs dokploy-traefik
+
+# Restart a service
+docker service update --force dokploy
+
+# Scale a service (not recommended for Dokploy core services)
+docker service scale dokploy=2
+```
+
+## Timezone configuration
+
+Each Dokploy service runs with the `TZ` environment variable set:
+
+```bash
+docker service inspect dokploy --format '{{.Spec.TaskTemplate.ContainerSpec.Env}}'
+```
+
+Expected output includes:
+```
+[TZ=Europe/Budapest ...]
+```
+
+For your deployed applications, set `TZ` in Dokploy:
+1. Go to your app's settings
+2. Navigate to **Environment Variables**
+3. Add: `TZ=Europe/Budapest` (or your timezone)
+
+## Storage and volumes
+
+Dokploy stores data in Docker volumes:
+
+```bash
+# List volumes
+docker volume ls | grep dokploy
+
+# Inspect a volume
+docker volume inspect dokploy_postgres-data
+```
+
+<Warning>
+Dokploy volumes contain your database, application data, and configurations. Set up backups before deploying production applications.
+</Warning>
+
+## Troubleshooting
+
+### Port 3000 not accessible
+
+Check if the service is running:
+
+```bash
+sudo docker service ls
+sudo docker service logs dokploy
+```
+
+Verify UFW allows Tailscale:
+
+```bash
+sudo ufw status | grep tailscale0
+```
+
+### Dokploy service won't start
+
+Check Docker Swarm status:
+
+```bash
+sudo docker info | grep Swarm
+# Should show: Swarm: active
+```
+
+View service errors:
+
+```bash
+sudo docker service ps dokploy --no-trunc
+```
+
+### Timezone not applied
+
+Manually update a service:
+
+```bash
+sudo docker service update --env-add TZ="Europe/Budapest" dokploy
+```
+
+## Files created
+
+| File | Purpose |
+|------|--------|
+| `/etc/setup-timezone` | Timezone backup from script 01 |
+| Docker volumes | Dokploy data and configs |
+
+## Next steps
+
+With Dokploy running on Tailscale, set up Cloudflare Tunnel to expose it securely to the internet:
+
+```bash
+sudo bash ~/setup/04_cloudflared.sh
+```

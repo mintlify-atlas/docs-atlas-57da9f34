@@ -1,0 +1,280 @@
+---
+title: Architecture
+description: Zero-trust architecture with Tailscale-only SSH, Cloudflare Tunnel for public traffic, and hypervisor-level firewall enforcement
+---
+
+## Overview
+
+Hetzner Zero Trust VPS implements defense-in-depth using multiple security layers that work together to eliminate public attack surface while maintaining full functionality for deployment and operations.
+
+## Network architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                         Internet                             │
+└───────────────┬─────────────────────────────────────────────┘
+                │
+                │  HTTPS (443)
+                ▼
+┌───────────────────────────────────────────────────────────┐
+│               Cloudflare Edge Network                      │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │  Zero Trust Access (email authentication)          │  │
+│  │  Exception: /api/deploy → Bypass (webhooks)        │  │
+│  └─────────────────────────────────────────────────────┘  │
+└───────────────┬───────────────────────────────────────────┘
+                │
+                │  Cloudflare Tunnel (encrypted)
+                ▼
+┌───────────────────────────────────────────────────────────┐
+│             Hetzner Cloud Firewall (Hypervisor)           │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │  Inbound rules:                                     │  │
+│  │  • UDP 41641 (Tailscale WireGuard)                 │  │
+│  │  • ICMP (ping)                                      │  │
+│  │  • ALL TCP BLOCKED                                  │  │
+│  └─────────────────────────────────────────────────────┘  │
+└───────────────┬───────────────────────────────────────────┘
+                │
+┌───────────────┴───────────────────────────────────────────┐
+│              Ubuntu 24.04 VPS (0.0.0.0)                    │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │ UFW (deny incoming, allow tailscale0, UDP 41641)   │  │
+│  └──────────┬──────────────────────────────────────────┘  │
+│             │                                              │
+│  ┌──────────┴──────────────────────────────────────────┐  │
+│  │  Docker Swarm (dokploy-network)                     │  │
+│  │                                                      │  │
+│  │  ┌──────────────┐   ┌─────────────┐                │  │
+│  │  │ cloudflared  │──►│   Traefik   │──► Apps        │  │
+│  │  │  :internal   │   │   :80       │                │  │
+│  │  └──────────────┘   └─────────────┘                │  │
+│  │                                                      │  │
+│  │  ┌──────────────┐   ┌─────────────┐                │  │
+│  │  │   Dokploy    │   │  Postgres   │                │  │
+│  │  │   :3000      │   │   Redis     │                │  │
+│  │  └──────────────┘   └─────────────┘                │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                             │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  SSH (port 22) — Tailscale 100.64.0.0/10 only       │  │
+│  │  • PermitRootLogin no                                │  │
+│  │  • PasswordAuthentication no                         │  │
+│  │  • AllowUsers *@100.64.0.0/10                        │  │
+│  └──────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+                ▲
+                │  Tailscale WireGuard (encrypted mesh)
+                │
+┌───────────────┴───────────────────────────────────────────┐
+│           Your devices (Tailscale network)                 │
+│  • SSH access: ssh user@100.x.x.x                         │
+│  • Dashboard: http://100.x.x.x:3000                       │
+│  • Internal apps: http://100.x.x.x:<port>                 │
+└───────────────────────────────────────────────────────────┘
+```
+
+## Traffic flows
+
+### Public application traffic
+
+1. Client requests `https://app.yourdomain.com`
+2. DNS resolves to Cloudflare proxy (`*.yourdomain.com` → `<tunnel-id>.cfargotunnel.com`)
+3. Cloudflare terminates TLS, forwards to Cloudflare Tunnel
+4. Tunnel connects to `cloudflared` container via persistent outbound connection
+5. `cloudflared` forwards to `dokploy-traefik:80` over Docker network
+6. Traefik routes based on domain to target container
+7. Response returns via same path
+
+<Info>
+**No inbound connections**: The tunnel is established outbound from the VPS. Cloudflare never initiates inbound connections. The Hetzner firewall blocks all inbound TCP.
+</Info>
+
+### Dokploy dashboard access
+
+1. User navigates to `https://dokploy.yourdomain.com`
+2. Cloudflare Zero Trust Access intercepts request
+3. User authenticates via email (Cloudflare-hosted login)
+4. After authentication, request flows through tunnel to Traefik → Dokploy
+5. Exception: `/api/deploy` path bypasses authentication (for GitHub webhooks)
+
+### SSH and administration
+
+1. Administrator on Tailscale network runs `ssh user@100.x.x.x`
+2. Traffic routed through Tailscale mesh network (WireGuard encrypted)
+3. Arrives at VPS on UDP 41641 (Tailscale's WireGuard port)
+4. SSH daemon only accepts connections from `100.64.0.0/10` (Tailscale CGNAT range)
+5. Public SSH port (22/tcp) is **never opened** at firewall level
+
+<Warning>
+**Hetzner Cloud Firewall is critical**: Docker Swarm bypasses UFW via iptables. The Hetzner Cloud Firewall operates at the hypervisor level—Docker cannot bypass it. Without it, ports 80, 443, and 3000 would be publicly accessible.
+</Warning>
+
+### Internal-only applications
+
+1. App deployed in Dokploy **without domain configured**
+2. Traefik has no routing rule (no domain = no public route)
+3. App binds to `0.0.0.0:<port>` (Docker Swarm limitation)
+4. Hetzner firewall blocks all inbound TCP from Internet
+5. Accessible only via Tailscale: `http://100.x.x.x:<port>`
+6. Perfect for internal tools, databases, admin panels
+
+## Security layers
+
+### Layer 1: Hetzner Cloud Firewall (hypervisor level)
+
+**Location**: Hetzner hypervisor (operates before traffic reaches VM)
+
+**Rules**:
+- **Inbound**: Only UDP 41641 (Tailscale WireGuard) and ICMP
+- **Outbound**: All allowed (for updates, Docker pulls, tunnel connection)
+
+**Why it matters**: This is the only firewall Docker **cannot** bypass. Docker Swarm manipulates iptables directly, which circumvents UFW. The Hetzner firewall enforces policy before packets reach the VM.
+
+### Layer 2: UFW (host firewall)
+
+**Location**: Ubuntu host iptables/nftables
+
+**Rules**:
+```bash
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow in on tailscale0      # Tailscale interface
+ufw allow 41641/udp comment "Tailscale WireGuard"
+```
+
+**Why it matters**: Provides defense-in-depth. Even if Hetzner firewall is misconfigured, UFW blocks unwanted traffic.
+
+<Note>
+Docker Swarm bypasses UFW for container ports via direct iptables rules. This is why the Hetzner Cloud Firewall is mandatory.
+</Note>
+
+### Layer 3: SSH hardening
+
+**Location**: `/etc/ssh/sshd_config.d/99-hardening.conf`
+
+**Configuration**:
+```
+AllowUsers *@100.64.0.0/10      # Tailscale CGNAT range only
+PermitRootLogin no              # No root login ever
+PasswordAuthentication no        # Key-based auth only
+MaxAuthTries 3                   # Limit brute force attempts
+X11Forwarding no                 # Disable forwarding
+AllowTcpForwarding no           # Disable tunneling
+AllowAgentForwarding no         # Disable agent forwarding
+PermitTunnel no                  # Disable tun device forwarding
+```
+
+**Why it matters**: Even from Tailscale network, SSH is hardened against compromise. No password brute force possible, no root access, no tunneling abuse.
+
+### Layer 4: Kernel hardening
+
+**Location**: `/etc/sysctl.d/99-security.conf`
+
+**Key settings**:
+- **SYN cookies**: Protection against SYN flood attacks
+- **ASLR**: Address space layout randomization (level 2)
+- **kptr_restrict**: Hide kernel pointers from unprivileged users
+- **dmesg_restrict**: Prevent dmesg access from non-root
+- **IP forwarding controls**: Disable redirects and source routing
+- **Log martians**: Log suspicious packets
+
+**Shared memory protection**: `/etc/fstab`
+```
+tmpfs /dev/shm tmpfs defaults,nosuid,nodev,noexec 0 0
+```
+
+### Layer 5: Cloudflare Zero Trust Access
+
+**Location**: Cloudflare Zero Trust dashboard
+
+**Application 1** (Dashboard protection):
+- **Domain**: `dokploy.yourdomain.com`
+- **Policy**: Allow only specific email addresses
+- **Action**: Require authentication via Cloudflare-hosted login
+
+**Application 2** (Webhook bypass):
+- **Domain**: `dokploy.yourdomain.com/api/deploy`
+- **Policy**: Everyone
+- **Action**: Bypass (no authentication)
+
+**Why it matters**: Cloudflare evaluates more specific paths first. GitHub webhooks hit `/api/deploy` and bypass authentication, while all other dashboard access requires email login. No self-managed authentication needed.
+
+### Layer 6: Docker Swarm isolation
+
+**Network**: `dokploy-network` (Docker bridge network)
+
+**Services communicate via Docker DNS**:
+- `cloudflared` → `dokploy-traefik:80` (internal Docker network)
+- No need for `localhost` or host networking
+- Containers isolated from host network namespace
+
+**Port binding**:
+- Swarm limitation: ports bind to `0.0.0.0` (cannot bind to specific IPs)
+- Mitigated by Hetzner Cloud Firewall blocking all inbound TCP
+
+## File locations
+
+| Path | Purpose | Created by |
+|------|---------|------------|
+| `/etc/sysctl.d/99-security.conf` | Kernel hardening parameters | `01_base.sh` |
+| `/etc/sysctl.d/99-swappiness.conf` | Swap tuning | `01_base.sh` |
+| `/etc/ssh/sshd_config.d/99-hardening.conf` | SSH hardening | `02_network.sh` |
+| `/etc/dokploy/` | Dokploy configuration | `03_dokploy.sh` |
+| `/etc/dokploy/traefik/traefik.yml` | Traefik reverse proxy config | Dokploy installer |
+| `/etc/setup-timezone` | Timezone saved for re-application | `01_base.sh` |
+| `/swapfile` | Swap file (default 4G) | `01_base.sh` |
+
+## Design decisions
+
+### Why Tailscale instead of VPN?
+
+- **Zero configuration**: WireGuard mesh network, no server setup
+- **NAT traversal**: Works behind firewalls without port forwarding
+- **Key rotation**: Automatic key management and rotation
+- **Access control**: Centralized via Tailscale admin console
+- **Multi-platform**: Works on all major OS and mobile devices
+
+### Why Cloudflare Tunnel instead of direct HTTPS?
+
+- **No open ports**: Tunnel established outbound, no inbound rules needed
+- **DDoS protection**: Cloudflare's network absorbs attacks
+- **TLS termination**: Cloudflare handles certificates automatically
+- **Zero Trust Access**: Built-in authentication without self-hosting
+- **Webhook bypass**: Path-based rules allow `/api/deploy` through
+
+### Why Docker Swarm instead of plain Docker?
+
+- **Dokploy requirement**: Dokploy uses Swarm mode for orchestration
+- **Service management**: `docker service` commands for updates
+- **Health checks**: Swarm monitors and restarts failed containers
+- **Secrets management**: Docker secrets for sensitive data
+
+<Warning>
+**Swarm limitation**: Cannot bind to specific IP addresses, only `0.0.0.0`. This is why the Hetzner Cloud Firewall is essential.
+</Warning>
+
+### Why SSL "Full" instead of "Full (Strict)"?
+
+- `cloudflared` connects to `dokploy-traefik:80` over **plain HTTP** inside Docker network
+- No certificate on the Traefik origin
+- The tunnel itself is encrypted end-to-end between Cloudflare edge and `cloudflared`
+- SSL Full mode: Cloudflare ↔ Tunnel (encrypted) → Traefik (HTTP, internal Docker network)
+
+### Why no fail2ban?
+
+- SSH is Tailscale-only (100.64.0.0/10)
+- Port scanners from Internet cannot reach port 22
+- Tailscale peers are trusted devices under your control
+- No public-facing authentication to brute force
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Prerequisites" icon="list-check" href="/prerequisites">
+    Check what you need before deployment
+  </Card>
+  <Card title="Base system setup" icon="server" href="/setup/base-system">
+    Begin the deployment process
+  </Card>
+</CardGroup>

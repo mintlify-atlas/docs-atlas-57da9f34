@@ -1,0 +1,216 @@
+---
+title: Base system setup
+description: Configure foundational system security, users, and environment
+---
+
+This guide walks through the initial system hardening and setup performed by `01_base.sh`. Run this script first as the root user after provisioning your Hetzner VPS.
+
+## Prerequisites
+
+- Fresh Ubuntu VPS from Hetzner
+- Root SSH access
+- Setup scripts cloned to the server
+
+## Overview
+
+The base system setup configures:
+
+- System updates and automatic security patches
+- Hostname and timezone
+- Kernel hardening parameters
+- Swap memory configuration
+- Non-root deployment user with SSH keys
+- Shared memory security
+
+## Configuration
+
+<Steps>
+
+<Step title="Run the base setup script">
+
+Execute the script as root:
+
+```bash
+sudo bash ~/setup/01_base.sh
+```
+
+The script will prompt for configuration values:
+
+- **Username**: Non-root user for deployments (default: `deploy`)
+- **Hostname**: Server hostname (default: `dokploy-prod`)
+- **Timezone**: System timezone (default: `Europe/Budapest`)
+- **Swap size**: Swap file size (default: `4G`)
+
+<Info>
+The script validates the timezone against the system's available timezones. Use `timedatectl list-timezones` to see valid options.
+</Info>
+
+</Step>
+
+<Step title="System updates">
+
+The script updates all packages and enables unattended security upgrades:
+
+```bash
+apt update && apt upgrade -y && apt autoremove -y
+apt install -y unattended-upgrades
+```
+
+Automatic update configuration (`/etc/apt/apt.conf.d/20auto-upgrades`):
+
+```conf
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::AutocleanInterval "7";
+APT::Periodic::Unattended-Upgrade "1";
+```
+
+</Step>
+
+<Step title="Kernel hardening">
+
+Security parameters are applied via `/etc/sysctl.d/99-security.conf`:
+
+```conf
+# Network protection
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+
+# Disable redirects and source routing
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.all.accept_source_route = 0
+
+# Logging and memory protection
+net.ipv4.conf.all.log_martians = 1
+kernel.randomize_va_space = 2
+kernel.kptr_restrict = 2
+kernel.dmesg_restrict = 1
+
+# Filesystem protection
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+fs.protected_regular = 2
+fs.protected_fifos = 2
+```
+
+These settings:
+- Enable SYN cookies to prevent SYN flood attacks
+- Block ICMP redirects and source routing
+- Enable Address Space Layout Randomization (ASLR)
+- Restrict kernel pointer visibility
+- Protect against symlink and hardlink attacks
+
+</Step>
+
+<Step title="Swap configuration">
+
+A swap file is created with optimized swappiness settings:
+
+```bash
+fallocate -l 4G /swapfile
+chmod 600 /swapfile
+mkswap /swapfile
+swapon /swapfile
+echo '/swapfile none swap sw 0 0' >> /etc/fstab
+```
+
+Swap tuning parameters (`/etc/sysctl.d/99-swappiness.conf`):
+
+```conf
+vm.swappiness=10
+vm.vfs_cache_pressure=50
+```
+
+<Note>
+`swappiness=10` means the system will only use swap when RAM is nearly full, prioritizing memory performance.
+</Note>
+
+</Step>
+
+<Step title="Shared memory security">
+
+The `/dev/shm` mount is secured against executable code:
+
+```bash
+echo 'tmpfs /dev/shm tmpfs defaults,nosuid,nodev,noexec 0 0' >> /etc/fstab
+mount -o remount /dev/shm
+```
+
+This prevents attackers from placing executable payloads in shared memory.
+
+</Step>
+
+<Step title="Non-root user creation">
+
+A deployment user is created with passwordless sudo:
+
+```bash
+adduser --disabled-password --gecos "" deploy
+usermod -aG sudo deploy
+echo "deploy ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/deploy
+chmod 440 /etc/sudoers.d/deploy
+```
+
+Root SSH keys are copied to the new user:
+
+```bash
+mkdir -p /home/deploy/.ssh
+cp /root/.ssh/authorized_keys /home/deploy/.ssh/authorized_keys
+chown -R deploy:deploy /home/deploy/.ssh
+chmod 700 /home/deploy/.ssh
+chmod 600 /home/deploy/.ssh/authorized_keys
+```
+
+<Warning>
+The script grants passwordless sudo for convenience during setup. After completing all scripts, consider requiring password for sudo by removing `/etc/sudoers.d/deploy`.
+</Warning>
+
+</Step>
+
+<Step title="Verify new user access">
+
+Before continuing, test SSH access with the new user in a **separate terminal**:
+
+```bash
+ssh deploy@YOUR_PUBLIC_IP
+sudo apt update  # Should not ask for password
+```
+
+<Warning>
+Keep your root session open until you verify the new user works! If SSH keys weren't copied correctly, you could lock yourself out.
+</Warning>
+
+</Step>
+
+</Steps>
+
+## Files created
+
+| File | Purpose |
+|------|--------|
+| `/etc/sysctl.d/99-security.conf` | Kernel hardening parameters |
+| `/etc/sysctl.d/99-swappiness.conf` | Swap tuning |
+| `/etc/apt/apt.conf.d/20auto-upgrades` | Automatic security updates |
+| `/etc/sudoers.d/deploy` | Passwordless sudo for deploy user |
+| `/etc/setup-timezone` | Timezone backup for script 03 |
+| `/swapfile` | Swap space |
+| `/home/deploy/setup/` | Setup scripts (moved from root) |
+
+## What happens to scripts
+
+The setup scripts are moved from their original location to `/home/deploy/setup/` and ownership is transferred to the deployment user.
+
+## Next steps
+
+Once you've verified the new user can SSH and run sudo commands:
+
+```bash
+sudo bash ~/setup/02_network.sh
+```
+
+This will configure Tailscale, harden SSH, and activate the firewall.

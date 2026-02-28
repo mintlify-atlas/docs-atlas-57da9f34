@@ -1,0 +1,244 @@
+---
+title: System hardening
+description: Kernel parameters, SSH configuration, and system-level security measures applied by the deployment scripts
+---
+
+The deployment scripts apply multiple layers of system hardening to secure your VPS against common attack vectors. All hardening is automated through `01_base.sh` and `02_network.sh`.
+
+## Kernel hardening
+
+Kernel security parameters are configured via `/etc/sysctl.d/99-security.conf` in `01_base.sh:51-78`:
+
+### Network protections
+
+```bash
+# Reverse path filtering (anti-spoofing)
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+
+# SYN flood protection
+net.ipv4.tcp_syncookies = 1
+
+# ICMP protections
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+
+# Disable ICMP redirects (IPv4 & IPv6)
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+
+# Disable sending ICMP redirects
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+
+# Disable source routing (IPv4 & IPv6)
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv6.conf.default.accept_source_route = 0
+
+# Log suspicious packets
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.log_martians = 1
+```
+
+<Info>
+**SYN cookies** protect against SYN flood attacks by encoding connection state in the SYN-ACK response instead of storing it in memory.
+</Info>
+
+### Kernel security features
+
+```bash
+# Address space layout randomization
+kernel.randomize_va_space = 2
+
+# Hide kernel pointers from unprivileged users
+kernel.kptr_restrict = 2
+
+# Restrict dmesg access
+kernel.dmesg_restrict = 1
+```
+
+<Accordion title="What is ASLR?">
+Address Space Layout Randomization (ASLR) randomizes memory addresses used by system and application processes, making it significantly harder for attackers to exploit memory corruption vulnerabilities.
+
+Setting `kernel.randomize_va_space = 2` enables full randomization including:
+- Stack locations
+- Heap allocations  
+- Shared library mappings
+- Executable positions
+</Accordion>
+
+### Filesystem protections
+
+```bash
+# Protect against hardlink/symlink attacks
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+
+# Protect FIFOs and regular files
+fs.protected_regular = 2
+fs.protected_fifos = 2
+```
+
+<Note>
+These filesystem protections prevent privilege escalation attacks where users create hardlinks or symlinks to files they don't own, or write to world-writable sticky directories.
+</Note>
+
+## Shared memory hardening
+
+The `/dev/shm` tmpfs filesystem is remounted with security flags (`01_base.sh:81-85`):
+
+```bash
+tmpfs /dev/shm tmpfs defaults,nosuid,nodev,noexec 0 0
+```
+
+- **nosuid**: Prevents setuid/setgid bits from taking effect
+- **nodev**: Prevents device files from being interpreted
+- **noexec**: Prevents execution of binaries stored in shared memory
+
+<Warning>
+Shared memory without `noexec` is a common target for attackers to store and execute malicious payloads after gaining initial access.
+</Warning>
+
+## SSH hardening
+
+SSH is locked down to Tailscale-only access with aggressive restrictions (`02_network.sh:63-84`).
+
+### Configuration applied
+
+A drop-in config file is created at `/etc/ssh/sshd_config.d/99-hardening.conf`:
+
+```bash
+# Only allow connections from Tailscale network
+AllowUsers *@100.64.0.0/10
+
+# Disable root login
+PermitRootLogin no
+
+# Public key authentication only
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+
+# Connection limits
+MaxAuthTries 3
+LoginGraceTime 30
+MaxSessions 3
+
+# Keep-alive (5 min idle, 2 checks = 10 min timeout)
+ClientAliveInterval 300
+ClientAliveCountMax 2
+
+# Disable forwarding features
+X11Forwarding no
+AllowTcpForwarding no
+AllowAgentForwarding no
+PermitTunnel no
+```
+
+<Info>
+**100.64.0.0/10** is Tailscale's CGNAT range. Only devices on your Tailscale network can connect via SSH.
+</Info>
+
+### Why these restrictions matter
+
+<Accordion title="AllowUsers *@100.64.0.0/10">
+Restricts SSH access to connections originating from the Tailscale network range. Public internet connections are rejected before authentication even begins.
+</Accordion>
+
+<Accordion title="PermitRootLogin no">
+Prevents direct root login. Combined with the non-root user setup, this forces a two-step process for administrative access, creating an audit trail.
+</Accordion>
+
+<Accordion title="PasswordAuthentication no">
+Forces public key authentication. Password-based attacks (brute force, credential stuffing) are completely ineffective.
+</Accordion>
+
+<Accordion title="MaxAuthTries 3">
+Limits authentication attempts per connection to 3. Reduces effectiveness of automated key-guessing attacks.
+</Accordion>
+
+<Accordion title="AllowTcpForwarding no">
+Prevents SSH port forwarding and tunneling. If an attacker compromises an SSH key, they can't use it to pivot to other networks or bypass firewall rules.
+</Accordion>
+
+## Automatic security updates
+
+Unattended security upgrades are enabled via `01_base.sh:39-47`:
+
+```bash
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::AutocleanInterval "7";
+APT::Periodic::Unattended-Upgrade "1";
+```
+
+- Updates check daily
+- Security patches install automatically
+- Package cache cleaned weekly
+
+<Tip>
+Check update logs with: `sudo journalctl -u unattended-upgrades`
+</Tip>
+
+## Swap configuration
+
+A swap file is created with reduced swappiness (`01_base.sh:88-101`):
+
+```bash
+vm.swappiness=10
+vm.vfs_cache_pressure=50
+```
+
+- **swappiness=10**: Kernel only swaps when necessary (default is 60)
+- **vfs_cache_pressure=50**: Reduces tendency to reclaim directory/inode cache
+
+This configuration prioritizes keeping active memory resident while still providing swap space for emergencies.
+
+## User configuration
+
+The deployment creates a non-root user with passwordless sudo (`01_base.sh:103-121`):
+
+```bash
+$NEW_USER ALL=(ALL) NOPASSWD:ALL
+```
+
+<Warning>
+**Passwordless sudo** is configured for deployment convenience. For production environments, consider:
+- Removing NOPASSWD after setup
+- Using `sudo -i` for administrative sessions
+- Implementing sudo logging and alerting
+</Warning>
+
+### SSH key inheritance
+
+The root user's `authorized_keys` are copied to the new user and proper permissions are enforced:
+
+```bash
+chmod 700 /home/$NEW_USER/.ssh
+chmod 600 /home/$NEW_USER/.ssh/authorized_keys
+```
+
+## Verification
+
+After running the hardening scripts, verify the configuration:
+
+```bash
+# Check active sysctl settings
+sudo sysctl -a | grep -E "rp_filter|tcp_syncookies|randomize_va_space"
+
+# Verify SSH config
+sudo sshd -T | grep -E "permitrootlogin|passwordauth|allowusers"
+
+# Check shared memory mount
+mount | grep /dev/shm
+
+# View unattended-upgrades status
+sudo systemctl status unattended-upgrades
+```
+
+<Note>
+All hardening is persistent across reboots. Configuration files are placed in `/etc/sysctl.d/`, `/etc/fstab`, and `/etc/ssh/sshd_config.d/`.
+</Note>

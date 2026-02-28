@@ -1,0 +1,240 @@
+---
+title: Prerequisites
+description: Required accounts, services, and configuration before deploying Hetzner Zero Trust VPS
+---
+
+## Infrastructure requirements
+
+### Hetzner Cloud VPS
+
+<Note>
+You need a Hetzner Cloud VPS with the following specifications:
+- **OS**: Ubuntu 24.04 LTS (fresh install)
+- **Architecture**: x86_64 or ARM64
+- **SSH key**: Pre-configured during VPS creation
+- **Root access**: Required for initial setup
+</Note>
+
+**Recommended specs**:
+- **Minimum**: CPX11 (2 vCPU, 2GB RAM) — suitable for testing
+- **Production**: CPX21 or higher (3+ vCPU, 4GB+ RAM) — better for multiple apps
+
+**How to create**:
+1. [console.hetzner.cloud](https://console.hetzner.cloud) → Create Server
+2. Location: Choose closest to your users
+3. Image: Ubuntu 24.04
+4. Type: Shared vCPU (CPX series) or Dedicated vCPU (CCX series)
+5. **SSH Key**: Add your public key (required for script 1 to copy keys)
+6. Firewall: None (you'll create it during script 2)
+7. Create & Boot
+
+<Warning>
+Use a **fresh** Ubuntu 24.04 installation. Do not use an existing server with prior configuration—it may conflict with the hardening scripts.
+</Warning>
+
+### Hetzner Cloud Firewall
+
+You'll create this during the setup process (after running script 2), but you should understand what it does:
+
+**Purpose**: Hypervisor-level firewall that Docker **cannot** bypass
+
+**Required rules**:
+
+| Protocol | Port | Source | Purpose |
+|----------|------|--------|----------|
+| UDP | 41641 | Any (0.0.0.0/0, ::/0) | Tailscale WireGuard |
+| ICMP | — | Any (0.0.0.0/0, ::/0) | Ping |
+
+<Info>
+**All TCP traffic blocked**: No inbound TCP rules. This includes ports 22 (SSH), 80 (HTTP), 443 (HTTPS), and 3000 (Dokploy). SSH is Tailscale-only. Web traffic flows through Cloudflare Tunnel.
+</Info>
+
+## Third-party services
+
+### Tailscale account
+
+**Required for**: SSH access, internal tool access, VPS administration
+
+**Setup**:
+1. Create account at [login.tailscale.com/start](https://login.tailscale.com/start)
+2. Install Tailscale client on your local machine:
+   - **macOS**: `brew install tailscale`
+   - **Linux**: [tailscale.com/download/linux](https://tailscale.com/download/linux)
+   - **Windows**: Download from [tailscale.com/download/windows](https://tailscale.com/download/windows)
+3. Authenticate: `tailscale up`
+
+**During setup**: Script 2 will install Tailscale on the VPS and prompt you to authenticate. You can use:
+- **Interactive mode**: Browser-based authentication (default)
+- **Auth key mode**: Pre-generate a reusable auth key from [login.tailscale.com/admin/settings/keys](https://login.tailscale.com/admin/settings/keys)
+
+<Tip>
+**Auth key advantages**:
+- Automation-friendly (no browser required)
+- Reusable across multiple servers
+- Can set expiry and tags during key creation
+</Tip>
+
+**Post-setup action**:
+- **Disable key expiry**: After script 2 authenticates the VPS, go to [login.tailscale.com/admin/machines](https://login.tailscale.com/admin/machines) → find your VPS → ⋯ → Disable key expiry
+- **Why**: Prevents VPS from losing Tailscale access after 180 days (default expiry)
+
+### Cloudflare account
+
+**Required for**: Public traffic routing, TLS termination, Zero Trust authentication
+
+**Setup**:
+1. Create account at [dash.cloudflare.com/sign-up](https://dash.cloudflare.com/sign-up)
+2. Add your domain to Cloudflare
+3. Update nameservers at your domain registrar to Cloudflare's nameservers
+4. Wait for DNS propagation (usually < 5 minutes)
+
+**Domain requirements**:
+- You own a domain (e.g., `example.com`)
+- DNS managed by Cloudflare (nameservers pointed to Cloudflare)
+- Domain can be used for subdomains (e.g., `dokploy.example.com`, `app.example.com`)
+
+<Warning>
+**Free tier is sufficient**: Cloudflare Tunnel and Zero Trust Access are available on the free plan. You do not need a paid Cloudflare account.
+</Warning>
+
+**What you'll configure during setup** (script 4):
+- Cloudflare Tunnel (Networks → Tunnels)
+- Wildcard DNS record (`*.yourdomain.com` → tunnel)
+- SSL/TLS mode set to "Full"
+- Zero Trust Access applications (dashboard protection + webhook bypass)
+
+### GitHub account
+
+**Required for**: Repository deployments, auto-deploy webhooks, CI/CD integration
+
+**Setup**:
+1. Create account at [github.com/signup](https://github.com/signup)
+2. Ensure you have repositories you want to deploy (or will create them)
+
+**What you'll use it for**:
+- Connecting GitHub to Dokploy (Settings → Git Providers → GitHub)
+- Deploying apps from GitHub repositories
+- Auto-deploy on push (webhooks to `dokploy.yourdomain.com/api/deploy`)
+
+<Info>
+GitHub integration is **optional** if you only plan to deploy from Docker images or Docker Compose files. However, auto-deploy on push requires GitHub connection.
+</Info>
+
+## Local machine requirements
+
+### SSH client
+
+**macOS/Linux**: Built-in OpenSSH client (`ssh` command)
+
+**Windows**:
+- **PowerShell** (Windows 10+): Built-in OpenSSH client
+- **WSL2**: Ubuntu or other Linux distribution with SSH
+- **PuTTY**: Traditional SSH client for Windows
+
+### SSH key pair
+
+**Generate if you don't have one**:
+
+```bash
+ssh-keygen -t ed25519 -C "your-email@example.com"
+```
+
+**Add public key to Hetzner**:
+1. Copy public key: `cat ~/.ssh/id_ed25519.pub`
+2. Hetzner console → SSH Keys → Add SSH Key
+3. Paste public key, give it a name
+4. Select this key when creating your VPS
+
+<Tip>
+**Ed25519 vs RSA**: Ed25519 is recommended (smaller keys, faster, more secure). If compatibility is needed, use RSA 4096-bit: `ssh-keygen -t rsa -b 4096`
+</Tip>
+
+### Web browser
+
+**Required for**:
+- Cloudflare dashboard configuration
+- Tailscale authentication
+- Dokploy web UI access (via Tailscale IP during setup)
+- Zero Trust Access login (email authentication)
+
+## Technical knowledge
+
+### Required skills
+
+<Note>
+You should be comfortable with:
+- Basic Linux command line (navigating directories, running commands)
+- SSH connections to remote servers
+- Understanding of DNS concepts (A records, CNAME, nameservers)
+- Docker basics (what containers are, general concepts)
+</Note>
+
+### Helpful but not required
+
+- Docker Compose syntax (for custom compose deployments)
+- Traefik configuration (for advanced routing)
+- GitHub Actions (for CI/CD workflows)
+- Shell scripting (for customizing setup scripts)
+
+## Pre-deployment checklist
+
+Before starting script 1, verify:
+
+- [ ] Hetzner VPS created with Ubuntu 24.04
+- [ ] SSH key added to Hetzner and VPS
+- [ ] Can SSH as root: `ssh root@<VPS_IP>`
+- [ ] Tailscale account created
+- [ ] Tailscale client installed on local machine
+- [ ] Cloudflare account created
+- [ ] Domain added to Cloudflare
+- [ ] Domain nameservers updated and DNS active
+- [ ] GitHub account created (if using Git deployments)
+
+<Warning>
+**Test SSH access first**: Before running any scripts, verify you can SSH as root with your key:
+
+```bash
+ssh root@<YOUR_VPS_IP>
+```
+
+If this fails, fix SSH access before proceeding. Common issues:
+- SSH key not added to Hetzner during VPS creation
+- Wrong IP address
+- Firewall blocking port 22 (shouldn't happen on fresh VPS)
+</Warning>
+
+## Estimated costs
+
+### Hetzner VPS
+
+| Server | vCPU | RAM | Storage | Price/month |
+|--------|------|-----|---------|-------------|
+| CPX11 | 2 | 2GB | 40GB | ~€5 |
+| CPX21 | 3 | 4GB | 80GB | ~€10 |
+| CPX31 | 4 | 8GB | 160GB | ~€19 |
+
+<Info>
+Prices approximate as of 2025. Check [hetzner.com/cloud](https://www.hetzner.com/cloud) for current pricing.
+</Info>
+
+### Third-party services
+
+| Service | Cost |
+|---------|------|
+| Tailscale (personal use, up to 100 devices) | **Free** |
+| Cloudflare Tunnel | **Free** |
+| Cloudflare Zero Trust Access (up to 50 users) | **Free** |
+| GitHub (public/private repos) | **Free** |
+
+**Total monthly cost**: VPS only (~€5-19/month depending on server size)
+
+## What's next?
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="diagram-project" href="/architecture">
+    Understand the zero-trust architecture
+  </Card>
+  <Card title="Base system setup" icon="server" href="/setup/base-system">
+    Begin the deployment process
+  </Card>
+</CardGroup>

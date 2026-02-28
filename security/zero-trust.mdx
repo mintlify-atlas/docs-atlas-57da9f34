@@ -1,0 +1,339 @@
+---
+title: Zero-trust architecture
+description: How Tailscale and Cloudflare Tunnel create a zero-trust security model with no exposed public ports
+---
+
+This project implements a true zero-trust architecture where:
+- **No SSH ports are exposed** to the public internet
+- **No application ports are exposed** to the public internet  
+- All admin access flows through Tailscale's encrypted mesh network
+- All public traffic flows through Cloudflare Tunnel with optional access controls
+
+## Architecture overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        PUBLIC INTERNET                       │
+└─────────────────────────────────────────────────────────────┘
+                    │                           │
+                    │                           │
+        ┌───────────▼──────────┐    ┌──────────▼──────────┐
+        │   Tailscale Control  │    │  Cloudflare Network │
+        │   (Coordination)     │    │   (Edge + Tunnel)   │
+        └───────────┬──────────┘    └──────────┬──────────┘
+                    │                           │
+                    │ Encrypted WireGuard       │ Tunnel (outbound)
+                    │ (UDP 41641)              │ (HTTPS)
+                    │                           │
+        ┌───────────▼───────────────────────────▼──────────┐
+        │              HETZNER VPS                          │
+        │  ┌────────────────────────────────────────────┐  │
+        │  │  UFW: deny all incoming except:            │  │
+        │  │  - tailscale0 interface (all traffic)     │  │
+        │  │  - UDP 41641 (Tailscale WireGuard)        │  │
+        │  └────────────────────────────────────────────┘  │
+        │                                                   │
+        │  ┌──────────────┐      ┌──────────────────────┐ │
+        │  │  Tailscale   │      │  Cloudflared         │ │
+        │  │  (tailscale0)│      │  (tunnel client)     │ │
+        │  │  100.64.x.x  │      │  → dokploy-traefik:80│ │
+        │  └──────┬───────┘      └──────────────────────┘ │
+        │         │                                        │
+        │         │ SSH (internal only)                   │
+        │         │                                        │
+        │  ┌──────▼──────────────────────────────────┐    │
+        │  │  Dokploy + Docker Swarm                │    │
+        │  │  - Port 3000 (Dokploy dashboard)       │    │
+        │  │  - Port 80/443 (Traefik → apps)        │    │
+        │  └────────────────────────────────────────┘    │
+        └───────────────────────────────────────────────────┘
+
+┌─────────────────────────────┐   ┌──────────────────────────┐
+│  Admin Access               │   │  Public User Access      │
+│  (Tailscale device)         │   │  (any browser)           │
+│                             │   │                          │
+│  ssh user@100.64.x.x        │   │  https://app.domain.com  │
+│  http://100.64.x.x:3000     │   │  ↓ Cloudflare Tunnel     │
+│  ↓ Direct Tailscale mesh    │   │  ↓ Optional Access rules │
+└─────────────────────────────┘   └──────────────────────────┘
+```
+
+## Layer 1: Tailscale mesh network
+
+Tailscale creates an encrypted WireGuard mesh connecting your devices to the VPS.
+
+### How it works
+
+1. **Coordination plane**: Tailscale's control server (login.tailscale.com) handles:
+   - Device authentication
+   - Key exchange and rotation
+   - Network topology updates
+   - ACL enforcement
+
+2. **Data plane**: Peer-to-peer encrypted tunnels using WireGuard:
+   - Direct connections when possible (NAT traversal)
+   - Relay servers (DERP) when direct connection fails
+   - All traffic encrypted end-to-end
+
+3. **Integration**: The VPS becomes a node in your Tailscale network:
+   - Gets a stable IP in the `100.64.0.0/10` range
+   - Accessible only by authenticated Tailscale devices
+   - SSH is restricted to this range (`02_network.sh:68`)
+
+<Info>
+Tailscale handles all the complexity of:
+- NAT traversal
+- Certificate management  
+- Key rotation
+- Firewall-friendly protocols
+</Info>
+
+### Security properties
+
+<Accordion title="Authentication">
+Every device must authenticate via your identity provider (Google, GitHub, Okta, etc.) before joining the Tailscale network. The VPS never directly authenticates users.
+</Accordion>
+
+<Accordion title="Encryption">
+All Tailscale traffic uses WireGuard:
+- ChaCha20-Poly1305 for encryption
+- Curve25519 for key exchange
+- BLAKE2s for hashing
+- Perfect forward secrecy (keys rotate automatically)
+</Accordion>
+
+<Accordion title="Zero-trust network access">
+Even if an attacker gains access to the Hetzner network, they can't reach your VPS without:
+1. Compromising a device already in your Tailscale network
+2. Breaking WireGuard encryption (computationally infeasible)
+3. Compromising Tailscale's control plane (independently audited)
+</Accordion>
+
+### Key expiry management
+
+By default, Tailscale node keys expire after 180 days for security. The deployment scripts prompt you to disable key expiry (`02_network.sh:48-50`):
+
+```
+https://login.tailscale.com/admin/machines → Your VPS → ⋯ → Disable key expiry
+```
+
+<Warning>
+**Why disable expiry for servers?**
+
+If the key expires, the VPS loses connectivity and becomes unreachable. For production infrastructure:
+- Disable key expiry on server nodes
+- Keep expiry enabled on personal devices
+- Use Tailscale ACLs to limit server access
+</Warning>
+
+## Layer 2: Cloudflare Tunnel
+
+Cloudflare Tunnel provides secure public access without exposing application ports.
+
+### How it works
+
+1. **Outbound-only connection**:
+   - The `cloudflared` daemon runs inside Dokploy (`04_cloudflared.sh:48-61`)
+   - Establishes persistent HTTPS connections to Cloudflare's edge
+   - No inbound firewall rules needed
+
+2. **Traffic flow**:
+   ```
+   User → Cloudflare Edge → Tunnel → cloudflared → dokploy-traefik:80 → Your App
+   ```
+
+3. **DNS management**:
+   - Wildcard route: `*.yourdomain.com` → tunnel → `dokploy-traefik:80`
+   - Cloudflare automatically handles DNS
+   - SSL terminated at Cloudflare edge
+
+<Info>
+**No public IP exposure**: Your VPS's public IP never appears in DNS records. Cloudflare acts as a reverse proxy, hiding the origin server.
+</Info>
+
+### Security properties
+
+<Accordion title="DDoS protection">
+Cloudflare's global network absorbs attacks before they reach your VPS:
+- 310+ Tbps network capacity
+- Automatic L3/L4 mitigation
+- L7 WAF rules (configurable)
+</Accordion>
+
+<Accordion title="SSL/TLS encryption">
+- Public traffic uses Cloudflare's SSL certificates
+- Edge-to-tunnel communication is encrypted
+- Configure SSL mode to "Full" (`04_cloudflared.sh:39-42`)
+</Accordion>
+
+<Accordion title="Access control (optional)">
+Cloudflare Access can add authentication in front of your apps:
+- Email OTP, Google, GitHub, Okta, etc.
+- Per-app or wildcard policies  
+- Zero-trust for public applications
+
+See [Cloudflare Tunnel configuration](/deploy/cloudflare-tunnel#zero-trust-access) for details.
+</Accordion>
+
+### Tunnel token security
+
+The tunnel token (`eyJ...`) is embedded in the cloudflared container (`04_cloudflared.sh:54`):
+
+```yaml
+command: tunnel --no-autoupdate run --token ${TUNNEL_TOKEN}
+```
+
+<Warning>
+**Token security best practices**:
+- Treat the token like a password
+- Rotate tokens periodically via Cloudflare dashboard
+- Delete unused tunnels immediately
+- Don't commit tokens to version control
+</Warning>
+
+## Layer 3: UFW firewall
+
+Uncomplicated Firewall (UFW) provides host-based defense in depth.
+
+### Rules applied
+
+From `02_network.sh:90-97`:
+
+```bash
+ufw default deny incoming  # Block all inbound by default
+ufw default allow outgoing # Allow all outbound
+ufw allow in on tailscale0 # Allow all traffic on Tailscale interface
+ufw allow 41641/udp        # Allow Tailscale WireGuard port
+```
+
+This creates an allowlist-only model:
+- All incoming traffic is denied by default
+- Only Tailscale traffic is permitted
+- Outbound connections unrestricted (for updates, Docker pulls, etc.)
+
+<Note>
+**Why allow UDP 41641?**
+
+This is Tailscale's WireGuard port. While Tailscale can work without it (using HTTPS fallback), opening this port enables faster peer-to-peer connections.
+</Note>
+
+### Docker and UFW
+
+Docker bypasses UFW by manipulating iptables directly. However, in this architecture:
+- Docker ports bind to `0.0.0.0` (Docker Swarm limitation)
+- Hetzner Cloud Firewall blocks public access (see next section)
+- Only Tailscale and Cloudflare Tunnel can reach Docker services
+
+<Tip>
+Verify UFW status:
+```bash
+sudo ufw status verbose
+```
+</Tip>
+
+## Layer 4: Hetzner Cloud Firewall
+
+Hetzner's network-level firewall provides an additional perimeter defense.
+
+### Recommended ruleset
+
+From the project README, configure in Hetzner Cloud Console:
+
+**Inbound rules:**
+- Allow UDP 41641 from `0.0.0.0/0` (Tailscale WireGuard)
+- Allow ICMP from `0.0.0.0/0` (optional, for ping/monitoring)
+- **Deny all other inbound traffic**
+
+**Outbound rules:**
+- Allow all (default)
+
+<Info>
+The Hetzner firewall operates at the hypervisor level, before traffic reaches your VPS. It's independent of UFW and provides defense against compromised VMs on the same network.
+</Info>
+
+## Zero-trust verification
+
+After deployment, verify your zero-trust configuration:
+
+### Port scan test
+
+From an external machine (not on Tailscale):
+
+```bash
+nmap -Pn -p 22,80,443,3000 YOUR_VPS_PUBLIC_IP
+```
+
+Expected result: All ports filtered or closed except UDP 41641.
+
+### SSH access test
+
+```bash
+# From non-Tailscale device (should fail)
+ssh user@YOUR_VPS_PUBLIC_IP
+# Expected: Connection refused or timeout
+
+# From Tailscale device (should succeed)
+ssh user@100.64.x.x
+# Expected: Successful login
+```
+
+### Application access test
+
+```bash
+# Direct IP access (should fail)
+curl -I http://YOUR_VPS_PUBLIC_IP:3000
+# Expected: Connection timeout
+
+# Tailscale access (should succeed)
+curl -I http://100.64.x.x:3000
+# Expected: HTTP 200 or redirect
+
+# Public domain via Cloudflare (should succeed)
+curl -I https://dokploy.yourdomain.com
+# Expected: HTTP 200
+```
+
+<Tip>
+Use `05_verify.sh` to run automated security checks.
+</Tip>
+
+## Threat model
+
+This architecture defends against:
+
+| Attack vector | Protection |
+|--------------|------------|
+| Port scanning | No exposed ports (except WireGuard) |
+| SSH brute force | SSH not accessible from public internet |
+| Application exploits | Public access proxied through Cloudflare WAF |
+| DDoS attacks | Cloudflare absorbs traffic before it reaches VPS |
+| Network-level attacks | Hetzner + UFW firewalls deny all non-whitelisted traffic |
+| Lateral movement | Tailscale ACLs can segment access (if configured) |
+| Compromised credentials | Requires access to Tailscale network + valid SSH key |
+
+<Warning>
+**Not protected against:**
+- Application-level vulnerabilities (SQLi, XSS, etc.) — secure your apps
+- Compromised Tailscale device — revoke device from admin panel
+- Stolen SSH private key — rotate keys, use hardware tokens
+- Social engineering — user education and MFA
+</Warning>
+
+## Compliance considerations
+
+This architecture provides properties useful for compliance:
+
+- **Network segmentation**: Admin and public traffic use separate paths
+- **Encrypted transport**: All traffic (Tailscale + Cloudflare) is encrypted in transit  
+- **Audit logs**: Tailscale logs all device connections; Cloudflare logs all HTTP requests
+- **Access control**: Centralized in Tailscale admin and Cloudflare Access
+- **No direct internet exposure**: Reduces attack surface for PCI DSS, SOC 2, etc.
+
+<Note>
+This project is designed for security, but **you are responsible** for:
+- Application security
+- Data encryption at rest
+- Log retention and monitoring
+- Incident response procedures
+- Compliance-specific requirements for your industry
+</Note>

@@ -1,0 +1,424 @@
+---
+title: Deploying apps
+description: Step-by-step guide to deploying applications on your zero-trust VPS platform
+---
+
+## Before you start
+
+Ensure you have:
+- Completed all setup scripts (01-05)
+- Cloudflare Tunnel running with wildcard DNS configured
+- Dokploy dashboard accessible at `https://dokploy.yourdomain.com`
+- GitHub account connected in Dokploy (for repository deployments)
+
+<Info>
+With the wildcard tunnel hostname already in place (`*.yourdomain.com` → your tunnel), you never need to touch DNS again. Just set the domain in Dokploy and deploy.
+</Info>
+
+## Deployment workflow
+
+<Steps>
+  <Step title="Create the application in Dokploy">
+    Navigate to your project in the Dokploy dashboard and click **+ Create Service**. Choose the appropriate type:
+    
+    - **Application** - for GitHub repositories (recommended)
+    - **Compose** - for Docker Compose configurations
+    - **Docker Image** - for pre-built container images
+  </Step>
+
+  <Step title="Configure the application source">
+    For GitHub repositories:
+    
+    1. Select **GitHub** as the provider
+    2. Choose your repository
+    3. Select the branch to deploy
+    4. Set the build path if needed (defaults to repository root)
+  </Step>
+
+  <Step title="Set environment variables">
+    Go to the **Environment** tab and add required variables:
+    
+    ```bash
+    # Required for Next.js deployments
+    NIXPACKS_NODE_VERSION=20
+    
+    # Required for all containers (they don't inherit host timezone)
+    TZ=Europe/Budapest
+    ```
+    
+    Add any application-specific variables your app needs.
+  </Step>
+
+  <Step title="Configure domain and port">
+    In the **Domains** tab:
+    
+    - **Domain**: Enter `app.yourdomain.com` (bare domain, no `https://`)
+    - **Port**: Set the container port your app listens on (e.g., `3000` for Next.js)
+    - **Protocol**: Select `HTTP` (Cloudflare handles HTTPS)
+    
+    <Warning>
+    Do not include `https://` in the domain field. Enter only the bare domain name.
+    </Warning>
+  </Step>
+
+  <Step title="Deploy">
+    Click **Deploy**. Dokploy will:
+    
+    1. Clone your repository
+    2. Build the container (using Nixpacks or Dockerfile)
+    3. Start the service
+    4. Configure Traefik routing
+    
+    Monitor the deployment logs in real-time from the dashboard.
+  </Step>
+
+  <Step title="Verify">
+    Once deployment completes, visit `https://app.yourdomain.com`.
+    
+    Traffic flows:
+    ```
+    Internet → Cloudflare → Tunnel → Traefik → Your app
+    ```
+  </Step>
+</Steps>
+
+## Deploying a Next.js application
+
+Complete example for deploying a Next.js app from GitHub:
+
+<Steps>
+  <Step title="Connect GitHub">
+    1. Dashboard → **Settings** → **Git** → **Git Providers**
+    2. Click **GitHub** and authorize Dokploy
+    3. Grant access to the repositories you want to deploy
+  </Step>
+
+  <Step title="Create the application">
+    1. Go to your project
+    2. **+ Create Service** → **Application**
+    3. Select **GitHub** as provider
+    4. Choose your Next.js repository
+    5. Select the branch (e.g., `main`)
+  </Step>
+
+  <Step title="Configure environment">
+    **Environment** tab - add:
+    
+    ```bash
+    NIXPACKS_NODE_VERSION=20
+    TZ=Europe/Budapest
+    ```
+    
+    <Note>
+    `NIXPACKS_NODE_VERSION=20` is required for new Next.js builds to succeed. Without it, the build will fail.
+    </Note>
+  </Step>
+
+  <Step title="Set domain and port">
+    **Domains** tab:
+    
+    - Domain: `app.yourdomain.com`
+    - Port: `3000`
+    - Path: `/` (default)
+    - Protocol: `HTTP`
+  </Step>
+
+  <Step title="Enable auto-deploy (optional)">
+    In the **General** tab, toggle **Auto Deploy** on.
+    
+    GitHub will send webhooks to `dokploy.yourdomain.com/api/deploy` on every push. The `/api/deploy` path bypasses Zero Trust authentication (configured in Setup step 4f).
+  </Step>
+
+  <Step title="Deploy and verify">
+    Click **Deploy** and wait for the build to complete.
+    
+    Visit `https://app.yourdomain.com` - your Next.js app is live.
+    
+    Future pushes to your branch will trigger automatic rebuilds if Auto Deploy is enabled.
+  </Step>
+</Steps>
+
+## Deploying with Docker Compose
+
+For applications that require multiple containers or custom configurations:
+
+<Steps>
+  <Step title="Create Compose service">
+    1. **+ Create Service** → **Compose**
+    2. Select **Provider** → **Raw Input**
+  </Step>
+
+  <Step title="Paste configuration">
+    Example compose configuration:
+    
+    ```yaml
+    services:
+      app:
+        image: your-image:latest
+        container_name: your-app
+        restart: unless-stopped
+        environment:
+          - TZ=Europe/Budapest
+          - DATABASE_URL=postgresql://user:pass@db:5432/dbname
+        networks:
+          - dokploy-network
+      
+      db:
+        image: postgres:16
+        container_name: your-db
+        restart: unless-stopped
+        environment:
+          - POSTGRES_USER=user
+          - POSTGRES_PASSWORD=pass
+          - POSTGRES_DB=dbname
+          - TZ=Europe/Budapest
+        volumes:
+          - db_data:/var/lib/postgresql/data
+        networks:
+          - dokploy-network
+    
+    networks:
+      dokploy-network:
+        external: true
+    
+    volumes:
+      db_data:
+    ```
+    
+    <Important>
+    Always use the `dokploy-network` external network for services that need to be accessible through Traefik or communicate with other Dokploy services.
+    </Important>
+  </Step>
+
+  <Step title="Configure domain">
+    In the **Domains** tab, set up routing to your service:
+    
+    - Domain: `service.yourdomain.com`
+    - Container: `your-app` (the service name from compose)
+    - Port: Container's listening port
+  </Step>
+
+  <Step title="Deploy">
+    Click **Deploy**. Dokploy will create all services defined in your compose file.
+  </Step>
+</Steps>
+
+## Internal-only applications
+
+To deploy an application that should only be accessible from your Tailscale network:
+
+<Steps>
+  <Step title="Deploy without a domain">
+    Create and configure your application normally, but **do not set any domain** in the Domains tab.
+  </Step>
+
+  <Step title="Note the container port">
+    Check which port your application listens on (e.g., `8080`).
+  </Step>
+
+  <Step title="Access via Tailscale">
+    The app is accessible only via:
+    
+    ```
+    http://<tailscale-ip>:<port>
+    ```
+    
+    For example:
+    ```
+    http://100.64.1.5:8080
+    ```
+  </Step>
+</Steps>
+
+<Info>
+Without a domain configured, Traefik has no routing rule. Combined with the Hetzner Cloud Firewall blocking all public TCP, the app is completely isolated from the internet.
+</Info>
+
+## Auto-deploy from GitHub
+
+Enable automatic deployments on every git push:
+
+### Setup
+
+1. **Connect GitHub** (if not already done):
+   - Settings → Git Providers → GitHub
+   - Authorize and grant repository access
+
+2. **Enable Auto Deploy**:
+   - Open your application in Dokploy
+   - General tab → Toggle **Auto Deploy** on
+
+3. **Set the branch**:
+   - Ensure the correct branch is selected (e.g., `main`, `develop`)
+
+### How it works
+
+When Auto Deploy is enabled:
+
+1. Dokploy registers a webhook with GitHub for the selected repository
+2. On every push to the configured branch, GitHub sends a webhook to:
+   ```
+   https://dokploy.yourdomain.com/api/deploy
+   ```
+3. This path bypasses Cloudflare Zero Trust authentication (configured during setup)
+4. Dokploy pulls the latest code and rebuilds the application
+5. The new version is deployed automatically
+
+<Tip>
+Webhook logs are visible in the Dokploy dashboard under each application's **Deployments** tab.
+</Tip>
+
+## Build configuration
+
+### Nixpacks (default)
+
+Dokploy uses Nixpacks to detect and build applications automatically. No Dockerfile required.
+
+**Environment variables for build customization:**
+
+```bash
+# Node.js version
+NIXPACKS_NODE_VERSION=20
+
+# Python version
+NIXPACKS_PYTHON_VERSION=3.11
+
+# Custom build command
+NIXPACKS_BUILD_CMD=npm run build:production
+
+# Custom start command
+NIXPACKS_START_CMD=npm run start:production
+```
+
+### Using a Dockerfile
+
+If your repository contains a `Dockerfile`, Dokploy will use it instead of Nixpacks.
+
+Ensure your Dockerfile:
+- Exposes the correct port
+- Sets the working directory
+- Defines the start command
+
+Example:
+```dockerfile
+FROM node:20-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+COPY . .
+EXPOSE 3000
+CMD ["npm", "start"]
+```
+
+## Application settings
+
+### Container resources
+
+Limit CPU and memory for individual applications:
+
+1. Application → **Advanced** tab
+2. Set resource limits:
+   - **Memory limit**: e.g., `512M`, `1G`
+   - **CPU limit**: e.g., `0.5`, `1.0`
+
+### Restart policies
+
+Configure how the container behaves on failure:
+
+- `unless-stopped` (default) - Always restart unless manually stopped
+- `always` - Always restart, even after manual stop
+- `on-failure` - Only restart on non-zero exit codes
+
+### Health checks
+
+Configure application health monitoring:
+
+1. Application → **Advanced** tab
+2. Add health check command:
+   ```bash
+   curl -f http://localhost:3000/health || exit 1
+   ```
+
+## Common deployment patterns
+
+### Static sites
+
+Deploy static HTML/JS sites:
+
+```yaml
+services:
+  web:
+    image: nginx:alpine
+    container_name: static-site
+    restart: unless-stopped
+    volumes:
+      - ./public:/usr/share/nginx/html:ro
+    networks:
+      - dokploy-network
+
+networks:
+  dokploy-network:
+    external: true
+```
+
+### Full-stack applications
+
+Example: Next.js frontend + PostgreSQL backend:
+
+1. Create application from GitHub repository
+2. Add PostgreSQL via Docker Compose in a separate service
+3. Connect via Docker network:
+   ```bash
+   DATABASE_URL=postgresql://user:pass@postgres-container:5432/db
+   ```
+
+### Microservices
+
+Deploy multiple services that communicate internally:
+
+- Each service joins `dokploy-network`
+- Services communicate via container names
+- Only expose public-facing services with domains
+- Keep internal APIs without domains (Tailscale-only access)
+
+## Monitoring deployments
+
+### Live logs
+
+View real-time logs during and after deployment:
+
+1. Application → **Logs** tab
+2. Select log source:
+   - **Build logs** - compilation output
+   - **Runtime logs** - application stdout/stderr
+
+### Deployment history
+
+View past deployments:
+
+1. Application → **Deployments** tab
+2. See all builds with timestamps and status
+3. Click any deployment to view full logs
+
+### Rollback
+
+To revert to a previous version:
+
+1. **Deployments** tab
+2. Find the working deployment
+3. Click **Redeploy** on that version
+
+<Warning>
+Rollback redeploys the same git commit. If you've made database migrations or other irreversible changes, manual intervention may be required.
+</Warning>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Daily usage" icon="calendar" href="/operations/daily-usage">
+    Common management tasks and monitoring
+  </Card>
+  <Card title="Troubleshooting" icon="wrench" href="/operations/troubleshooting">
+    Fix common deployment issues
+  </Card>
+</CardGroup>

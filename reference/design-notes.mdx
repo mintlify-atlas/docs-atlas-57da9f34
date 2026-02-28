@@ -1,0 +1,269 @@
+---
+title: Design notes
+description: Rationale and design decisions behind the Hetzner Zero Trust VPS architecture
+---
+
+This page documents the "why" behind key architectural decisions in the project. Understanding these design choices helps when troubleshooting or adapting the setup for different use cases.
+
+---
+
+## Why no fail2ban?
+
+**SSH is Tailscale-only. Port scanners can't reach it.**
+
+fail2ban monitors authentication logs and bans IPs after repeated failed login attempts. In a zero-trust setup, SSH is only accessible via Tailscale's CGNAT range (`100.64.0.0/10`), enforced by:
+
+1. **SSH config**: `AllowUsers *@100.64.0.0/10` in `/etc/ssh/sshd_config.d/99-hardening.conf`
+2. **UFW**: Only allows traffic on the `tailscale0` interface
+3. **Hetzner Cloud Firewall**: Blocks all inbound TCP at the hypervisor level
+
+Public SSH port scanners never reach the server — there's no 22/tcp listening on the public interface. Brute force attacks against SSH are impossible.
+
+<Info>
+fail2ban is valuable for public-facing services like web servers, but unnecessary for SSH in this architecture.
+</Info>
+
+---
+
+## Why 0.0.0.0 for Dokploy?
+
+**Docker Swarm can't bind to specific IPs. Hetzner Cloud Firewall blocks all inbound TCP at the hypervisor — Docker can't bypass it.**
+
+Dokploy runs in Docker Swarm mode, which [binds published ports to `0.0.0.0` by design](https://docs.docker.com/engine/swarm/ingress/). You cannot bind Swarm services to a specific interface like `127.0.0.1` or a Tailscale IP.
+
+This means ports 80, 443, and 3000 are technically "listening" on all interfaces:
+
+```bash
+$ ss -tlnp | grep ':3000'
+LISTEN 0      4096         0.0.0.0:3000       0.0.0.0:*
+```
+
+However:
+
+- **UFW** denies all incoming traffic except `tailscale0` and UDP 41641
+- **Hetzner Cloud Firewall** operates at the hypervisor level, blocking all inbound TCP before it reaches the VPS
+
+Docker Swarm's iptables rules can bypass UFW, but they **cannot** bypass the Hetzner Cloud Firewall. The firewall is enforced upstream from the VPS network stack.
+
+<Note>
+This is a fundamental difference from Docker Compose mode, where you can bind to `127.0.0.1:3000` or `100.x.x.x:3000`. Swarm's ingress network does not support this.
+</Note>
+
+---
+
+## Why no Docker SSH exceptions?
+
+**Dokploy uses the Docker socket directly. It doesn't SSH into the host like Coolify does.**
+
+Some deployment platforms (e.g., Coolify) manage remote Docker hosts by SSH-ing into them and running `docker` commands. This requires SSH exceptions for Docker networks.
+
+Dokploy runs **inside** the Docker Swarm as a service. It communicates with the Docker daemon via the mounted socket at `/var/run/docker.sock`. It never initiates SSH connections to the host.
+
+SSH hardening in `/etc/ssh/sshd_config.d/99-hardening.conf` does not require `AllowUsers` exceptions for Docker networks like `172.17.0.0/16` because Dokploy never uses SSH to manage containers.
+
+---
+
+## Why dokploy-traefik:80 instead of localhost:80?
+
+**cloudflared and Traefik share Docker's `dokploy-network`. They communicate via Docker DNS — cleaner than host networking.**
+
+When configuring the Cloudflare Tunnel public hostname route, the service URL is set to:
+
+```
+HTTP → dokploy-traefik:80
+```
+
+Not `localhost:80` or `127.0.0.1:80`.
+
+### Why Docker DNS?
+
+Both `cloudflared` and `dokploy-traefik` are on the same Docker network (`dokploy-network`). Docker's embedded DNS server resolves `dokploy-traefik` to the Traefik container's internal IP.
+
+This is cleaner than:
+
+- **Host networking** (`network_mode: host`): Requires cloudflared to run with elevated privileges and exposes all host ports
+- **localhost binding**: Only works if Traefik binds to `127.0.0.1`, which conflicts with external access needs
+
+Docker DNS keeps container-to-container traffic isolated and avoids iptables complexity.
+
+<Info>
+If cloudflared logs show "connection refused" to `dokploy-traefik:80`, verify both are on `dokploy-network`:
+
+```bash
+docker inspect cloudflared | grep dokploy-network
+docker inspect dokploy-traefik | grep dokploy-network
+```
+</Info>
+
+---
+
+## Why SSL Full, not Full Strict?
+
+**cloudflared connects to Traefik over plain HTTP inside Docker. No cert on the origin. The tunnel itself is encrypted end-to-end.**
+
+Cloudflare SSL/TLS modes:
+
+| Mode | Description | Use case |
+|------|-------------|----------|
+| **Off** | No encryption | Never use |
+| **Flexible** | Cloudflare ↔ client encrypted, Cloudflare ↔ origin plain HTTP | Origin has no cert |
+| **Full** | Cloudflare ↔ client encrypted, Cloudflare ↔ origin encrypted (self-signed OK) | **Used here** |
+| **Full (Strict)** | Cloudflare ↔ client encrypted, Cloudflare ↔ origin encrypted with valid CA cert | Origin has Let's Encrypt or Cloudflare Origin CA |
+
+### Why Full?
+
+The Cloudflare Tunnel (`cloudflared`) connects to Traefik at `dokploy-traefik:80` — plain HTTP. Traefik does not have a TLS certificate configured because:
+
+1. The tunnel encrypts traffic between Cloudflare's edge and the cloudflared container
+2. Traefik only handles HTTP routing inside the Docker network
+3. Cloudflare terminates SSL at the edge and presents a valid certificate to users
+
+**Full Strict** would fail because Traefik has no certificate. **Full** mode works because Cloudflare accepts any encryption (or none) between the edge and cloudflared, as long as the tunnel itself is encrypted.
+
+<Note>
+The tunnel connection itself is encrypted via WireGuard-like protocol. The HTTP connection between cloudflared and Traefik is **inside** the Docker network and never exposed.
+</Note>
+
+---
+
+## Why no Let's Encrypt in Dokploy?
+
+**Cloudflare handles SSL termination. Let's Encrypt is redundant and adds complexity.**
+
+Dokploy has built-in Let's Encrypt support via Traefik. In a traditional setup, Traefik requests certificates from Let's Encrypt using the ACME protocol and handles SSL termination.
+
+In this zero-trust setup:
+
+- All public traffic arrives via Cloudflare Tunnel
+- Cloudflare terminates SSL at the edge with its own certificates
+- Users see a valid Cloudflare certificate (or your uploaded custom cert)
+- Traefik receives plain HTTP from cloudflared
+
+Enabling Let's Encrypt would:
+
+1. Require opening port 80 or 443 publicly for ACME challenges (defeats zero-trust)
+2. Require managing cert renewals (Cloudflare certs auto-renew)
+3. Add Traefik SSL termination overhead inside Docker (unnecessary)
+
+<Info>
+If you need end-to-end encryption inside the Docker network, use Cloudflare Origin CA certificates, not Let's Encrypt.
+</Info>
+
+---
+
+## Why wildcard DNS instead of per-app records?
+
+**One-time setup. Deploy new apps without touching DNS.**
+
+A wildcard CNAME record:
+
+```
+*.yourdomain.com CNAME <tunnel-id>.cfargotunnel.com
+```
+
+Routes **all** subdomains through the Cloudflare Tunnel automatically.
+
+When you deploy a new app in Dokploy and set its domain to `app.yourdomain.com`:
+
+1. Traefik creates a routing rule for `app.yourdomain.com`
+2. The wildcard DNS record already points it to the tunnel
+3. The wildcard tunnel route (`*` → `dokploy-traefik:80`) forwards traffic to Traefik
+4. Traefik routes to the correct container based on the `Host` header
+
+No manual DNS changes needed after initial setup.
+
+<Info>
+If you want per-app DNS control, replace the wildcard with individual CNAME records for each subdomain.
+</Info>
+
+---
+
+## Why Cloudflare Zero Trust instead of Traefik BasicAuth?
+
+**Email-based authentication, no password management, works with GitHub webhooks.**
+
+Traefik's BasicAuth requires a username and password for access. Cloudflare Zero Trust Access offers:
+
+- **Email-based login**: Authenticate via email OTP or third-party SSO (Google, GitHub, etc.)
+- **Path-specific policies**: Protect `dokploy.yourdomain.com` but bypass `/api/deploy` for GitHub webhooks
+- **Audit logs**: Track who accessed the dashboard and when
+- **No password storage**: Credentials are managed by Cloudflare, not in environment variables or Docker secrets
+
+The two-application setup in script 04 allows:
+
+- **Dokploy dashboard**: Protected by email login
+- **GitHub webhooks**: Bypass authentication on `/api/deploy` so auto-deploy works
+
+Traefik BasicAuth would require storing credentials in the Traefik config and doesn't support path-specific bypasses without complex middleware rules.
+
+---
+
+## Why passwordless sudo for deploy user?
+
+**Scripts 02-05 require frequent root operations. Prompting for passwords 50+ times is impractical.**
+
+The deploy user is granted `NOPASSWD:ALL` in `/etc/sudoers.d/<user>`. This allows `sudo` without a password.
+
+**Why is this safe?**
+
+1. **SSH key authentication only**: The user cannot log in with a password (`PasswordAuthentication no`)
+2. **Tailscale-only access**: SSH is restricted to `100.64.0.0/10`, reachable only by authenticated Tailscale peers
+3. **Single-user VPS**: This is a dedicated deployment server, not a multi-tenant system
+4. **Root login disabled**: Root cannot log in via SSH after script 02
+
+If you prefer password prompts, remove `/etc/sudoers.d/<user>` after completing setup:
+
+```bash
+sudo rm /etc/sudoers.d/<user>
+```
+
+You will need to set a password with `sudo passwd <user>` first.
+
+---
+
+## Why Tailscale instead of WireGuard?
+
+**Zero-config NAT traversal, automatic key rotation, managed DNS, and built-in ACLs.**
+
+WireGuard is the protocol Tailscale uses under the hood, but Tailscale adds:
+
+- **NAT traversal**: Works behind carrier-grade NAT, mobile networks, and restrictive firewalls
+- **Automatic key rotation**: No manual key management
+- **Centralized ACLs**: Control access via Tailscale admin console, not per-server iptables rules
+- **MagicDNS**: Refer to nodes by hostname (e.g., `ssh dokploy-prod`) instead of IP
+- **Key expiry management**: Prevent abandoned nodes from lingering on the network
+
+Raw WireGuard requires:
+
+- Manual peer configuration on every device
+- Static IP management or dynamic DNS
+- Custom ACLs with iptables or nftables
+- No built-in solution for NAT traversal
+
+For a single-server deployment, Tailscale's overhead is negligible and setup is 10x faster.
+
+---
+
+## Why Docker Swarm instead of Kubernetes?
+
+**Dokploy requires Swarm. It's also simpler for single-server deployments.**
+
+Dokploy is built on Docker Swarm and uses Swarm's service orchestration for:
+
+- Zero-downtime rolling updates
+- Service placement constraints
+- Secrets management
+- Built-in load balancing via ingress network
+
+Kubernetes is overkill for a single-node deployment and requires:
+
+- Separate control plane setup (kubeadm, k3s, etc.)
+- External load balancer (MetalLB, Traefik, etc.)
+- Persistent volume management (local-path-provisioner, etc.)
+- Significantly higher memory overhead
+
+Swarm is Docker-native and initializes with a single command: `docker swarm init`.
+
+<Note>
+If you need multi-server orchestration, Kubernetes is the better choice. This project targets single-server deployments.
+</Note>

@@ -1,0 +1,432 @@
+---
+title: File locations
+description: Reference for all configuration files, scripts, and directories used in the Hetzner Zero Trust VPS setup
+---
+
+This page documents all configuration files, directories, and their purposes in the deployed system.
+
+---
+
+## Setup scripts
+
+<Note>
+These files are deleted if you choose "yes" during the cleanup prompt in `05_verify.sh`.
+</Note>
+
+| Path | Description |
+|------|-------------|
+| `~/setup/01_base.sh` | Base system setup script (run as root) |
+| `~/setup/02_network.sh` | Tailscale, SSH, and UFW setup |
+| `~/setup/03_dokploy.sh` | Docker, Swarm, and Dokploy installation |
+| `~/setup/04_cloudflared.sh` | Cloudflare Tunnel setup (interactive) |
+| `~/setup/05_verify.sh` | Security audit and cleanup |
+| `~/setup/README.md` | Project README (copy of upstream) |
+| `/root/cloudflared-compose.yml` | Generated cloudflared compose file (deleted during cleanup) |
+
+---
+
+## System configuration
+
+### Kernel hardening
+
+<ParamField path="/etc/sysctl.d/99-security.conf" type="sysctl config">
+Kernel security parameters:
+
+- **Network**: SYN cookies, reverse path filtering, ICMP hardening
+- **Routing**: Disabled ICMP redirects, source routing
+- **Memory**: ASLR, kernel pointer restrictions, dmesg restrictions
+- **Filesystem**: Protected hardlinks, symlinks, FIFOs, regular files
+
+Applied by: `01_base.sh`
+
+Reload: `sudo sysctl -p /etc/sysctl.d/99-security.conf`
+</ParamField>
+
+<ParamField path="/etc/sysctl.d/99-swappiness.conf" type="sysctl config">
+Swap behavior tuning:
+
+```ini
+vm.swappiness=10
+vm.vfs_cache_pressure=50
+```
+
+- `swappiness=10`: Prefer RAM over swap (reduces disk I/O)
+- `vfs_cache_pressure=50`: Balance between caching inodes/dentries and page cache
+
+Applied by: `01_base.sh`
+</ParamField>
+
+### SSH hardening
+
+<ParamField path="/etc/ssh/sshd_config.d/99-hardening.conf" type="SSH config">
+SSH server hardening:
+
+```plaintext
+AllowUsers *@100.64.0.0/10
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+MaxAuthTries 3
+LoginGraceTime 30
+ClientAliveInterval 300
+ClientAliveCountMax 2
+MaxSessions 3
+X11Forwarding no
+AllowTcpForwarding no
+AllowAgentForwarding no
+PermitTunnel no
+```
+
+Applied by: `02_network.sh`
+
+Restart SSH: `sudo systemctl restart ssh`
+</ParamField>
+
+<ParamField path="/etc/ssh/sshd_config.backup" type="backup">
+Backup of original `/etc/ssh/sshd_config` before hardening.
+
+Created by: `02_network.sh`
+</ParamField>
+
+### Automatic updates
+
+<ParamField path="/etc/apt/apt.conf.d/20auto-upgrades" type="apt config">
+Unattended upgrades configuration:
+
+```plaintext
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::AutocleanInterval "7";
+APT::Periodic::Unattended-Upgrade "1";
+```
+
+Applied by: `01_base.sh`
+</ParamField>
+
+### Filesystem
+
+<ParamField path="/etc/fstab" type="filesystem table">
+Contains swap and `/dev/shm` mount with security flags:
+
+```plaintext
+/swapfile none swap sw 0 0
+tmpfs /dev/shm tmpfs defaults,nosuid,nodev,noexec 0 0
+```
+
+- `/swapfile`: Swap file (default 4G)
+- `/dev/shm`: Shared memory with `noexec` (prevents executable code in shared memory)
+
+Applied by: `01_base.sh`
+</ParamField>
+
+<ParamField path="/swapfile" type="swap">
+Swap file created by `01_base.sh`.
+
+Default size: 4G
+
+Permissions: `600` (root only)
+
+Check status: `swapon --show`
+</ParamField>
+
+### Timezone
+
+<ParamField path="/etc/timezone" type="timezone config">
+Standard Linux timezone file.
+
+**Note**: Dokploy installer may reset this file. Script `03_dokploy.sh` re-applies the timezone from `/etc/setup-timezone`.
+</ParamField>
+
+<ParamField path="/etc/setup-timezone" type="custom">
+Custom file created by `01_base.sh` to preserve user-selected timezone.
+
+Used by `03_dokploy.sh` to restore timezone after Dokploy installation (which may reset `/etc/timezone`).
+</ParamField>
+
+### User permissions
+
+<ParamField path="/etc/sudoers.d/<user>" type="sudoers">
+Passwordless sudo configuration for deploy user:
+
+```plaintext
+<user> ALL=(ALL) NOPASSWD:ALL
+```
+
+Created by: `01_base.sh`
+
+Permissions: `440`
+
+Remove after setup if you prefer password prompts:
+```bash
+sudo rm /etc/sudoers.d/<user>
+sudo passwd <user>  # Set password first
+```
+</ParamField>
+
+---
+
+## Dokploy
+
+<ParamField path="/etc/dokploy/" type="directory">
+Dokploy configuration directory.
+
+Contains:
+- Traefik configuration
+- Dokploy service settings
+- Docker Compose stack files
+
+Managed by: Dokploy installer
+</ParamField>
+
+<ParamField path="/etc/dokploy/traefik/traefik.yml" type="Traefik config">
+Traefik reverse proxy configuration.
+
+**Default settings**:
+- Listens on ports 80 and 443
+- Uses Docker provider for service discovery
+- Exposes dashboard on port 8080 (Tailscale-only access)
+
+Managed by: Dokploy
+
+<Info>
+Do not manually edit this file. Dokploy regenerates it when settings change.
+</Info>
+</ParamField>
+
+<ParamField path="/var/lib/docker/volumes/" type="directory">
+Docker volumes for persistent data:
+
+- `dokploy-postgres-data/`: PostgreSQL database (apps, projects, deployments)
+- `dokploy-redis-data/`: Redis cache (build queue, logs)
+- App-specific volumes (created per deployment)
+
+**Backup strategy**: Back up this directory for full system restore.
+</ParamField>
+
+---
+
+## Docker
+
+<ParamField path="/var/run/docker.sock" type="socket">
+Docker daemon socket.
+
+Mounted into Dokploy container to manage Docker services.
+
+**Permissions**: `root:docker` (group `docker`)
+
+**Security**: Only accessible by root and users in `docker` group. In this setup, only Dokploy service accesses it.
+</ParamField>
+
+<ParamField path="/var/lib/docker/swarm/" type="directory">
+Docker Swarm state and certificates.
+
+Contains:
+- Swarm node ID
+- TLS certificates for inter-node communication
+- Raft consensus data (single-node Swarm uses local Raft)
+
+Do not delete this directory — Swarm will lose all service definitions.
+</ParamField>
+
+---
+
+## User files
+
+<ParamField path="/home/<user>/.ssh/authorized_keys" type="SSH keys">
+SSH public keys for the deploy user.
+
+Copied from `/root/.ssh/authorized_keys` by `01_base.sh`.
+
+Permissions: `600`
+
+Add new keys:
+```bash
+echo "ssh-ed25519 AAAA..." >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+```
+</ParamField>
+
+<ParamField path="/home/<user>/.bash_history" type="shell history">
+Bash command history for the deploy user.
+
+**Security note**: May contain sensitive commands (e.g., tokens pasted during setup). Clear with:
+```bash
+history -c
+rm ~/.bash_history
+```
+</ParamField>
+
+---
+
+## Tailscale
+
+<ParamField path="/var/lib/tailscale/" type="directory">
+Tailscale state and configuration.
+
+Contains:
+- Node private key
+- Tailscale IP assignment
+- Peer connection state
+
+**Do not delete** this directory — Tailscale will lose its identity and require re-authentication.
+</ParamField>
+
+<ParamField path="/etc/systemd/system/tailscaled.service" type="systemd unit">
+Tailscale daemon service.
+
+Installed by: Tailscale installer (via `02_network.sh`)
+
+Manage:
+```bash
+sudo systemctl status tailscaled
+sudo systemctl restart tailscaled
+```
+</ParamField>
+
+---
+
+## Logs
+
+<ParamField path="/var/log/syslog" type="system log">
+System-wide logs, including:
+
+- SSH authentication attempts
+- UFW denials
+- Tailscale connection events
+- Kernel messages
+
+View SSH logs:
+```bash
+sudo grep sshd /var/log/syslog
+```
+
+View UFW denials:
+```bash
+sudo grep UFW /var/log/syslog
+```
+</ParamField>
+
+<ParamField path="/var/log/unattended-upgrades/" type="directory">
+Unattended upgrades logs:
+
+- `unattended-upgrades.log`: Update history
+- `unattended-upgrades-dpkg.log`: Package manager output
+
+Check recent updates:
+```bash
+sudo tail -f /var/log/unattended-upgrades/unattended-upgrades.log
+```
+</ParamField>
+
+<ParamField path="Docker logs (via journalctl)" type="systemd journal">
+Docker service logs:
+
+```bash
+sudo journalctl -u docker -f
+```
+
+Dokploy service logs:
+```bash
+sudo docker service logs dokploy -f
+```
+
+cloudflared logs (via Dokploy dashboard or CLI):
+```bash
+docker logs cloudflared -f
+```
+</ParamField>
+
+---
+
+## Network interfaces
+
+<ParamField path="tailscale0" type="network interface">
+Tailscale virtual network interface.
+
+IP range: `100.64.0.0/10` (Tailscale CGNAT)
+
+Check status:
+```bash
+ip addr show tailscale0
+tailscale status
+```
+</ParamField>
+
+<ParamField path="docker0" type="network interface">
+Docker bridge network.
+
+Default IP: `172.17.0.1/16`
+
+Used for default Docker containers (not Swarm services).
+</ParamField>
+
+<ParamField path="dokploy-network" type="Docker network">
+Docker bridge network for Dokploy services.
+
+Created by: Dokploy installer
+
+Used by:
+- Dokploy dashboard
+- Traefik
+- PostgreSQL
+- Redis
+- cloudflared
+- Deployed apps (if configured)
+
+Inspect:
+```bash
+docker network inspect dokploy-network
+```
+</ParamField>
+
+---
+
+## Firewall rules
+
+<ParamField path="UFW rules" type="firewall">
+Configured by `02_network.sh`:
+
+```plaintext
+default deny incoming
+default allow outgoing
+allow in on tailscale0
+allow 41641/udp  # Tailscale WireGuard
+```
+
+View rules:
+```bash
+sudo ufw status verbose
+```
+
+Add custom rule:
+```bash
+sudo ufw allow in on tailscale0 to any port 8080
+```
+</ParamField>
+
+<ParamField path="Hetzner Cloud Firewall" type="cloud firewall">
+Configured manually after `02_network.sh`:
+
+**Inbound rules**:
+- UDP 41641 from Any (Tailscale WireGuard)
+- ICMP from Any (Ping)
+
+**Outbound rules**: Allow all (default)
+
+Operates at hypervisor level — Docker Swarm cannot bypass it.
+
+Manage at: [console.hetzner.cloud](https://console.hetzner.cloud) → Firewalls
+</ParamField>
+
+---
+
+## Cleanup checklist
+
+After setup, these files can be safely deleted:
+
+- `~/setup/` (all setup scripts)
+- `/root/cloudflared-compose.yml`
+- `/root/setup/` (if scripts were copied here)
+- `~/.bash_history` (if it contains sensitive data)
+
+Run `05_verify.sh` and choose "yes" to clean up automatically.

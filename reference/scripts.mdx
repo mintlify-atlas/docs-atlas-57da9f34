@@ -1,0 +1,384 @@
+---
+title: Scripts reference
+description: Detailed reference for all deployment scripts in the Hetzner Zero Trust VPS project
+---
+
+The deployment process consists of five sequential bash scripts that transform a fresh Ubuntu 24.04 VPS into a hardened, zero-trust Dokploy instance. Each script must be run in order, and most require root privileges via `sudo`.
+
+## Overview
+
+| Script | Run as | What it does | Duration |
+|--------|--------|--------------|----------|
+| `01_base.sh` | root | System hardening, swap, user creation | 2-5 min |
+| `02_network.sh` | deploy user | Tailscale, SSH lockdown, UFW | 3-5 min |
+| `03_dokploy.sh` | deploy user | Docker, Swarm, Dokploy, timezone | 2-5 min |
+| `04_cloudflared.sh` | deploy user | Cloudflare Tunnel setup (interactive) | 5-10 min |
+| `05_verify.sh` | deploy user | Security audit + cleanup | 1 min |
+
+---
+
+## 01_base.sh
+
+<Note>
+This is the **only** script that runs directly as root. All subsequent scripts are run as the deploy user with `sudo`.
+</Note>
+
+### Purpose
+
+Initializes the base system with security hardening, creates a non-root deploy user, and configures essential system settings.
+
+### What it does
+
+<Accordion title="System updates">
+- Runs `apt update && apt upgrade -y`
+- Removes unused packages with `apt autoremove`
+- Ensures all packages are current before hardening
+</Accordion>
+
+<Accordion title="Hostname and timezone">
+- Sets hostname via `hostnamectl`
+- Configures timezone via `timedatectl`
+- Saves timezone to `/etc/setup-timezone` for script 03 to reference (Dokploy installer may reset `/etc/timezone`)
+</Accordion>
+
+<Accordion title="Automatic security updates">
+- Installs `unattended-upgrades`
+- Creates `/etc/apt/apt.conf.d/20auto-upgrades`
+- Enables daily package list updates and weekly auto-clean
+</Accordion>
+
+<Accordion title="Kernel hardening">
+Creates `/etc/sysctl.d/99-security.conf` with:
+
+- **Network protection**: SYN cookies, reverse path filtering, ICMP hardening
+- **Routing security**: Disables ICMP redirects and source routing (IPv4 and IPv6)
+- **Memory protection**: ASLR (`randomize_va_space=2`), kernel pointer restrictions
+- **Filesystem protection**: Protected hardlinks, symlinks, FIFOs, and regular files
+- **Logging**: Martian packet logging enabled
+</Accordion>
+
+<Accordion title="Shared memory hardening">
+- Adds `/dev/shm` mount to `/etc/fstab` with `nosuid,nodev,noexec`
+- Prevents executable code in shared memory (mitigates privilege escalation)
+</Accordion>
+
+<Accordion title="Swap creation">
+- Creates swap file with `fallocate` (default 4G)
+- Sets `vm.swappiness=10` and `vm.vfs_cache_pressure=50` via `/etc/sysctl.d/99-swappiness.conf`
+- Low swappiness reduces disk I/O on VPS instances
+</Accordion>
+
+<Accordion title="User creation">
+- Creates non-root user with `adduser`
+- Grants passwordless `sudo` via `/etc/sudoers.d/<user>`
+- Copies root SSH authorized_keys to new user
+- Moves setup scripts from `/root/setup/` to `/home/<user>/setup/`
+</Accordion>
+
+### Interactive prompts
+
+- **Username** (default: `deploy`)
+- **Hostname** (default: `dokploy-prod`)
+- **Timezone** (default: `Europe/Budapest`)
+- **Swap size** (default: `4G`)
+
+### When to run
+
+Immediately after SSH-ing into a fresh VPS as root.
+
+### After completion
+
+<Info>
+Verify the new user works in a **new terminal** before closing the root session:
+
+```bash
+ssh <user>@<YOUR_VPS_IP>
+sudo apt update  # should not prompt for password
+```
+
+Root login will be disabled by script 02.
+</Info>
+
+---
+
+## 02_network.sh
+
+<Note>
+Run as the deploy user created by script 01. **Do not run as root from this point forward.**
+</Note>
+
+### Purpose
+
+Installs Tailscale for secure SSH access, hardens SSH configuration to Tailscale-only, and sets up UFW firewall rules.
+
+### What it does
+
+<Accordion title="Tailscale installation">
+- Downloads and runs official Tailscale installer from `tailscale.com/install.sh`
+- Enables and starts `tailscaled` service
+- Supports two authentication methods:
+  - **Interactive**: Opens browser URL for login
+  - **Auth key**: Pre-generated `tskey-auth-...` for automation
+</Accordion>
+
+<Accordion title="Tailscale authentication">
+- Authenticates node with `tailscale up`
+- Retrieves Tailscale IP with `tailscale ip -4`
+- Prompts to disable key expiry in Tailscale admin console
+- **Pauses** to verify Tailscale SSH works before locking down public SSH
+</Accordion>
+
+<Accordion title="SSH hardening">
+Creates `/etc/ssh/sshd_config.d/99-hardening.conf` with:
+
+- `AllowUsers *@100.64.0.0/10` — Tailscale CGNAT range only
+- `PermitRootLogin no` — Disables root login
+- `PasswordAuthentication no` — Key-only authentication
+- `MaxAuthTries 3` — Rate limit login attempts
+- `LoginGraceTime 30` — 30 second connection window
+- `ClientAliveInterval 300` — Keep-alive every 5 minutes
+- `X11Forwarding no` — Disables X11
+- `AllowTcpForwarding no` — Disables port forwarding
+- `AllowAgentForwarding no` — Disables SSH agent forwarding
+- `PermitTunnel no` — Disables VPN tunneling
+
+<Info>
+No Docker SSH exceptions needed — Dokploy uses the Docker socket directly, unlike Coolify.
+</Info>
+</Accordion>
+
+<Accordion title="UFW firewall">
+- Sets default deny incoming, allow outgoing
+- Allows all traffic on `tailscale0` interface
+- Allows UDP port `41641` (Tailscale WireGuard)
+- Enables UFW with `ufw enable`
+</Accordion>
+
+### Interactive prompts
+
+- **Authentication method**: Interactive (1) or auth key (2)
+- **Auth key**: If method 2 selected
+- **Disable key expiry confirmation**: Manual step in Tailscale admin
+- **Tailscale SSH verification**: Must confirm Tailscale SSH works before continuing
+
+### When to run
+
+After verifying the deploy user from script 01 works via standard SSH.
+
+### After completion
+
+<Info>
+Set up the Hetzner Cloud Firewall before continuing:
+
+1. [console.hetzner.cloud](https://console.hetzner.cloud) → Firewalls → Create
+2. Name: `zero-public-ports`
+3. **Only** allow:
+   - UDP port `41641` from Any (Tailscale WireGuard)
+   - ICMP from Any (Ping)
+4. Apply to your server
+
+This operates at the hypervisor level — Docker Swarm cannot bypass it.
+</Info>
+
+---
+
+## 03_dokploy.sh
+
+### Purpose
+
+Installs Docker, Docker Swarm, and Dokploy, then applies server timezone to all Dokploy services.
+
+### What it does
+
+<Accordion title="Dokploy installation">
+- Downloads and runs official Dokploy installer: `curl -sSL https://dokploy.com/install.sh | sh`
+- Installs Docker Engine if not present
+- Initializes Docker Swarm mode
+- Deploys Dokploy stack (dashboard, Traefik, PostgreSQL, Redis)
+- Binds to `0.0.0.0` on ports 80, 443, 3000 (Swarm limitation)
+</Accordion>
+
+<Accordion title="Timezone configuration">
+- Reads timezone from `/etc/setup-timezone` (saved by script 01)
+- Re-applies timezone to host with `timedatectl` (Dokploy installer may reset it)
+- Waits 10 seconds for Swarm services to start
+- Updates each Dokploy service with `TZ` environment variable:
+  - `dokploy`
+  - `dokploy-postgres`
+  - `dokploy-redis`
+
+<Info>
+Docker containers do not inherit the host timezone. Each deployed app must set `TZ=<timezone>` in its environment variables.
+</Info>
+</Accordion>
+
+<Accordion title="Verification">
+- Lists Docker services with `docker service ls`
+- Shows listening ports (80, 443, 3000) with `ss -tlnp`
+</Accordion>
+
+### Interactive prompts
+
+None — fully automated.
+
+### When to run
+
+After setting up the Hetzner Cloud Firewall (post script 02).
+
+### After completion
+
+<Info>
+Open the Dokploy dashboard at `http://<TAILSCALE_IP>:3000` from a Tailscale device:
+
+1. Create admin account (first visitor becomes admin)
+2. **Skip Let's Encrypt setup** — Cloudflare handles SSL
+
+The dashboard will move to `https://dokploy.yourdomain.com` after script 04.
+</Info>
+
+---
+
+## 04_cloudflared.sh
+
+### Purpose
+
+Interactive guide to set up Cloudflare Tunnel, deploy cloudflared in Dokploy, and configure Cloudflare Zero Trust Access.
+
+### What it does
+
+This script is **fully interactive** and walks through manual Cloudflare dashboard steps. It does not make API calls to Cloudflare.
+
+<Accordion title="Step 1: Create tunnel and add wildcard route">
+- Prompts to create tunnel at [one.dash.cloudflare.com](https://one.dash.cloudflare.com)
+- Type: Cloudflared
+- Name: e.g., `dokploy-prod`
+- Copy tunnel token (`eyJ...`)
+- Add public hostname route:
+  - Subdomain: `*`
+  - Domain: `yourdomain.com`
+  - Service: HTTP → `dokploy-traefik:80`
+- This wildcard route must exist before configuring Zero Trust Access
+</Accordion>
+
+<Accordion title="Step 2: Set SSL mode">
+- Cloudflare dashboard → your domain → SSL/TLS
+- Set to **Full** (not Full Strict)
+- cloudflared connects to Traefik over plain HTTP inside Docker
+- The tunnel itself is encrypted end-to-end
+</Accordion>
+
+<Accordion title="Step 3: Deploy cloudflared in Dokploy">
+- Generates Docker Compose file at `/root/cloudflared-compose.yml` with user's tunnel token
+- Displays compose config for copy-paste
+- User deploys via: Dokploy → Project → + Create Service → Compose → Raw Input
+- Must be on `dokploy-network` to communicate with Traefik via Docker DNS
+</Accordion>
+
+<Accordion title="Step 4: Set Dokploy server domain">
+- Dokploy → Settings → WebServer → Server Domain
+- Set to `dokploy.yourdomain.com` (bare domain, no `https://`)
+- Required for GitHub webhook URLs to work for auto-deploy
+</Accordion>
+
+<Accordion title="Step 5: Verify tunnel">
+- Check cloudflared logs in Dokploy for "connection registered"
+- Verify tunnel status in Cloudflare Zero Trust → Tunnels shows "Healthy"
+</Accordion>
+
+### Interactive prompts
+
+- **Tunnel token**: Paste from Cloudflare tunnel wizard
+- **Confirmation prompts**: After each manual step
+
+### When to run
+
+After completing initial Dokploy setup (post script 03).
+
+### After completion
+
+<Info>
+Set up Cloudflare Zero Trust Access to secure the dashboard:
+
+**Application 1 — Protect the dashboard:**
+- Domain: `dokploy.yourdomain.com`
+- Policy: Allow → Emails → `your@example.com`
+
+**Application 2 — Bypass for webhooks:**
+- Domain: `dokploy.yourdomain.com/api/deploy`
+- Policy: Bypass → Everyone
+
+Cloudflare evaluates more specific paths first, so webhooks work while the dashboard requires email login.
+</Info>
+
+---
+
+## 05_verify.sh
+
+### Purpose
+
+Runs comprehensive security audit and offers cleanup of setup scripts.
+
+### What it does
+
+<Accordion title="Tailscale checks">
+- Connection status
+- Tailscale IP retrieval
+</Accordion>
+
+<Accordion title="SSH checks">
+- Root login disabled (`PermitRootLogin no`)
+- Password authentication disabled
+- Tailscale-only restriction (`100.64.0.0/10`)
+</Accordion>
+
+<Accordion title="UFW checks">
+- UFW active status
+- Tailscale interface allowed
+- Ports 80 and 443 **not** publicly exposed
+</Accordion>
+
+<Accordion title="Docker Swarm checks">
+- Swarm active status
+</Accordion>
+
+<Accordion title="Dokploy checks">
+- Dokploy service running
+- Dashboard listening on port 3000
+- Traefik listening on port 80
+</Accordion>
+
+<Accordion title="Cloudflared checks">
+- Container running status (warns if not deployed)
+</Accordion>
+
+<Accordion title="Kernel hardening checks">
+- SYN cookies enabled
+- ASLR enabled (`randomize_va_space=2`)
+- Kernel pointer restrictions (`kptr_restrict=2`)
+- dmesg restrictions (`dmesg_restrict=1`)
+</Accordion>
+
+<Accordion title="Other checks">
+- Swap active
+- `/dev/shm` mounted with `noexec`
+- Unattended upgrades enabled
+</Accordion>
+
+<Accordion title="Cleanup">
+- Offers to delete all setup scripts (`01_*.sh` through `05_*.sh`)
+- Removes `/root/cloudflared-compose.yml`
+- Removes `.git` directory if present
+- Removes setup directory if empty
+</Accordion>
+
+### Interactive prompts
+
+- **Cleanup confirmation**: Delete setup scripts? (yes/no)
+
+### When to run
+
+After completing all setup steps and verifying the Cloudflare Tunnel is healthy.
+
+### After completion
+
+System is production-ready. Access SSH only via Tailscale, and manage deployments through `https://dokploy.yourdomain.com`.

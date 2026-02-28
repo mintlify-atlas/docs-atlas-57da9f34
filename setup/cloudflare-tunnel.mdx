@@ -1,0 +1,353 @@
+---
+title: Cloudflare Tunnel
+description: Configure Cloudflare Tunnel to securely expose Dokploy and applications to the internet
+---
+
+This guide covers `04_cloudflared.sh`, which sets up a Cloudflare Tunnel to route public traffic to your Dokploy instance without opening firewall ports.
+
+## Prerequisites
+
+- Completed [Dokploy installation](/setup/dokploy-installation)
+- Domain name managed by Cloudflare
+- Cloudflare account with Zero Trust access
+- Dokploy dashboard accessible via Tailscale
+
+## Overview
+
+Cloudflare Tunnel (cloudflared) creates an outbound-only connection from your server to Cloudflare's edge network. This eliminates the need to open ports 80/443 on your firewall.
+
+Traffic flow:
+```
+Internet → Cloudflare Edge → Tunnel → Traefik (localhost:80) → Your App
+```
+
+<Info>
+All traffic is encrypted in the tunnel. Cloudflare handles SSL/TLS termination, so your origin server uses plain HTTP.
+</Info>
+
+## Configuration
+
+<Steps>
+
+<Step title="Run the Cloudflare Tunnel script">
+
+Execute as root:
+
+```bash
+sudo bash ~/setup/04_cloudflared.sh
+```
+
+The script is interactive and guides you through the Cloudflare dashboard configuration.
+
+</Step>
+
+<Step title="Create tunnel in Cloudflare dashboard">
+
+Follow the script's prompts:
+
+1. Go to https://one.dash.cloudflare.com
+2. Navigate to **Networks** → **Tunnels**
+3. Click **Create a tunnel**
+4. Select **Cloudflared** as the connector type
+5. Name your tunnel (e.g., `dokploy-prod`)
+6. Click **Save tunnel**
+
+<Note>
+The wizard will show a tunnel token (`eyJ...`). Copy it — you'll paste it into the script shortly.
+</Note>
+
+</Step>
+
+<Step title="Configure wildcard public hostname route">
+
+Before saving the tunnel, add the wildcard route:
+
+**Public Hostname:**
+- **Subdomain**: `*` (asterisk for wildcard)
+- **Domain**: Select your domain (e.g., `yourdomain.com`)
+
+**Service:**
+- **Type**: HTTP
+- **URL**: `dokploy-traefik:80`
+
+<Info>
+The service name `dokploy-traefik` refers to the Traefik container in Docker Swarm. Cloudflare resolves this via Docker's internal DNS.
+</Info>
+
+Click **Save tunnel** in the Cloudflare dashboard.
+
+<Warning>
+The wildcard route must be configured before proceeding. Without it, Zero Trust access policies won't work.
+</Warning>
+
+Press **Enter** in the script once the tunnel is saved.
+
+</Step>
+
+<Step title="Paste tunnel token">
+
+Back in the terminal, paste the tunnel token when prompted:
+
+```
+Now paste the tunnel token (eyJ...): 
+```
+
+The token is a long JWT string starting with `eyJ`. It contains encrypted credentials for the tunnel.
+
+</Step>
+
+<Step title="Set SSL mode in Cloudflare">
+
+Configure SSL/TLS encryption mode:
+
+1. Go to Cloudflare dashboard → **your domain** → **SSL/TLS**
+2. Set encryption mode to **Full** (not Full Strict)
+
+<Info>
+**Full** mode encrypts traffic between Cloudflare and your origin but doesn't verify the certificate (since Traefik uses a self-signed cert or none at all).
+</Info>
+
+Press **Enter** once configured.
+
+</Step>
+
+<Step title="Deploy cloudflared in Dokploy">
+
+The script generates a Docker Compose file at `/root/cloudflared-compose.yml`:
+
+```yaml
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token YOUR_TUNNEL_TOKEN
+    networks:
+      - dokploy-network
+
+networks:
+  dokploy-network:
+    external: true
+```
+
+The `dokploy-network` is the Docker Swarm overlay network that all Dokploy services share.
+
+Deploy the container in Dokploy:
+
+1. Open Dokploy dashboard (http://100.x.y.z:3000)
+2. Go to your project → **Create Service** → **Compose**
+3. Select **Provider: Raw Input**
+4. Copy and paste the compose YAML displayed in the terminal
+5. Click **Save** → **Deploy**
+
+<Note>
+The script displays the compose file content. Copy it from the terminal.
+</Note>
+
+Wait for the container to start, then press **Enter**.
+
+</Step>
+
+<Step title="Set server domain in Dokploy">
+
+Tell Dokploy its public domain so webhooks and callbacks work:
+
+1. In Dokploy, go to **Settings** → **Server**
+2. Find **Server Domain** field
+3. Enter: `dokploy.yourdomain.com` (bare domain, no `https://` prefix)
+4. Click **Save**
+
+<Info>
+This setting is used by Dokploy to generate webhook URLs for GitHub/GitLab integration. Without it, auto-deploy on push won't work.
+</Info>
+
+Press **Enter** once saved.
+
+</Step>
+
+<Step title="Verify tunnel health">
+
+Check that the tunnel is connected:
+
+**In Dokploy:**
+1. Go to the `cloudflared` service
+2. Click **Logs**
+3. Look for: `"Connection registered"`
+
+**In Cloudflare:**
+1. Go to **Zero Trust** → **Networks** → **Tunnels**
+2. Your tunnel should show status: **Healthy**
+
+Press **Enter** once healthy.
+
+</Step>
+
+</Steps>
+
+## Verification
+
+Test public access to Dokploy:
+
+```bash
+curl -I https://dokploy.yourdomain.com
+```
+
+Expected response:
+```
+HTTP/2 200
+server: cloudflare
+...
+```
+
+<Warning>
+At this point, the Dokploy dashboard is publicly accessible. Proceed to configure Zero Trust access policies to secure it.
+</Warning>
+
+## Traffic flow
+
+With Cloudflare Tunnel configured:
+
+```
+┌─────────┐        ┌───────────┐        ┌─────────┐        ┌────────┐
+│ Browser │───────▶│ Cloudflare│───────▶│ Tunnel  │───────▶│Traefik │
+│         │ HTTPS  │   Edge    │ Tunnel │cloudflrd│  HTTP  │  :80   │
+└─────────┘        └───────────┘        └─────────┘        └────────┘
+                                                                  │
+                                                                  ▼
+                                                            ┌──────────┐
+                                                            │  Dokploy │
+                                                            │   :3000  │
+                                                            └──────────┘
+```
+
+- **Public access**: https://dokploy.yourdomain.com → Cloudflare → Tunnel
+- **Admin access**: http://100.x.y.z:3000 → Tailscale → Direct
+
+## Cloudflared container details
+
+The cloudflared container:
+- Runs in the `dokploy-network` Docker overlay network
+- Connects to `dokploy-traefik:80` via Docker's internal DNS
+- Maintains 4 persistent connections to Cloudflare edge servers
+- Automatically reconnects if connections drop
+
+```bash
+# View logs
+docker logs cloudflared -f
+
+# Restart container
+docker restart cloudflared
+
+# Check network connectivity
+docker exec cloudflared ping dokploy-traefik
+```
+
+## Adding applications
+
+With the wildcard route configured, deploying new apps is simple:
+
+1. Deploy your app in Dokploy
+2. In app settings, set **Domain**: `myapp.yourdomain.com`
+3. No DNS changes needed — Cloudflare routes via the wildcard
+
+Traefik automatically:
+- Detects the new container via Docker labels
+- Routes traffic based on hostname
+- Handles HTTP → HTTPS redirects (if configured)
+
+<Tip>
+Use bare domains without the `https://` prefix in Dokploy. The protocol is added automatically.
+</Tip>
+
+## Cloudflare SSL/TLS modes
+
+| Mode | Encryption | Certificate Required |
+|------|------------|---------------------|
+| **Full** (recommended) | Browser ↔ CF: Yes, CF ↔ Origin: Yes | Self-signed or none |
+| Full (Strict) | Browser ↔ CF: Yes, CF ↔ Origin: Yes | Valid certificate from CA |
+| Flexible | Browser ↔ CF: Yes, CF ↔ Origin: No | None |
+
+<Warning>
+Do not use "Flexible" mode. It leaves traffic between Cloudflare and your origin unencrypted.
+</Warning>
+
+## Dokploy domain configuration
+
+After setting the Server Domain:
+
+- **Dashboard**: `https://dokploy.yourdomain.com`
+- **API**: `https://dokploy.yourdomain.com/api/`
+- **Webhooks**: `https://dokploy.yourdomain.com/api/webhook/github`
+
+GitHub/GitLab will use these URLs for auto-deploy webhooks.
+
+## Troubleshooting
+
+### Tunnel shows "Unhealthy"
+
+Check cloudflared logs:
+
+```bash
+docker logs cloudflared
+```
+
+Common issues:
+- Invalid token: Regenerate in Cloudflare dashboard
+- Network connectivity: Verify outbound HTTPS is allowed
+- Docker network: Ensure container is in `dokploy-network`
+
+### Can't reach dokploy-traefik:80
+
+Verify Traefik is running:
+
+```bash
+docker service ls | grep traefik
+ss -tlnp | grep :80
+```
+
+Test connectivity from cloudflared container:
+
+```bash
+docker exec cloudflared ping dokploy-traefik
+docker exec cloudflared wget -O- http://dokploy-traefik:80
+```
+
+### SSL errors ("Invalid certificate")
+
+Check Cloudflare SSL mode:
+- Must be **Full**, not Full (Strict)
+- Verify in **SSL/TLS** → **Overview**
+
+### Wildcard route not working for subdomains
+
+Ensure the wildcard `*.yourdomain.com` route is configured in Cloudflare Tunnel settings, not just `yourdomain.com`.
+
+## Files created
+
+| File | Purpose |
+|------|--------|
+| `/root/cloudflared-compose.yml` | Docker Compose config (saved for reference) |
+
+<Note>
+The compose file is saved for backup but not actively used after deployment. Dokploy manages the running container.
+</Note>
+
+## Cleanup
+
+The compose file can be deleted after successful deployment:
+
+```bash
+rm /root/cloudflared-compose.yml
+```
+
+The tunnel token is embedded in the running container and doesn't need to be stored separately.
+
+## Next steps
+
+Verify the entire setup:
+
+```bash
+sudo bash ~/setup/05_verify.sh
+```
+
+This script checks all security configurations and confirms the zero-trust setup is complete.

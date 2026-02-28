@@ -1,0 +1,432 @@
+---
+title: Firewall configuration
+description: UFW rules, Hetzner Cloud Firewall setup, and Docker networking considerations
+---
+
+This project uses a defense-in-depth firewall strategy with three layers: Hetzner Cloud Firewall (network perimeter), UFW (host-based), and application-level access controls via Cloudflare.
+
+## UFW (Uncomplicated Firewall)
+
+UFW is configured automatically by `02_network.sh` with an allowlist-only approach.
+
+### Default policies
+
+Set in `02_network.sh:92-93`:
+
+```bash
+ufw default deny incoming
+ufw default allow outgoing
+```
+
+- **Deny incoming**: All inbound connections blocked unless explicitly allowed
+- **Allow outgoing**: Permits system updates, Docker image pulls, Cloudflare Tunnel connection, etc.
+
+### Active rules
+
+From `02_network.sh:94-95`:
+
+```bash
+ufw allow in on tailscale0
+ufw allow 41641/udp comment "Tailscale WireGuard"
+```
+
+| Rule | Purpose | Source |
+|------|---------|--------|
+| `allow in on tailscale0` | All traffic on Tailscale interface | Any Tailscale device |
+| `allow 41641/udp` | Tailscale WireGuard port | `0.0.0.0/0` (public) |
+
+<Info>
+**Why is 41641/udp public?**
+
+Tailscale uses UDP 41641 for its WireGuard protocol. While Tailscale can operate without this (falling back to HTTPS), opening this port enables:
+- Faster direct peer-to-peer connections
+- Lower latency for SSH and admin access
+- Reduced load on Tailscale's relay servers
+
+The port only accepts encrypted WireGuard traffic — unauthenticated packets are dropped by Tailscale.
+</Info>
+
+### Managing UFW
+
+Common commands:
+
+```bash
+# View status and rules
+sudo ufw status verbose
+
+# View numbered rules (useful for deletion)
+sudo ufw status numbered
+
+# Add a rule (example)
+sudo ufw allow from 203.0.113.0/24 to any port 443
+
+# Delete a rule by number
+sudo ufw delete 5
+
+# Disable UFW (not recommended)
+sudo ufw disable
+
+# Re-enable UFW
+sudo ufw enable
+```
+
+<Warning>
+Do not disable UFW without understanding the consequences. It provides critical defense even when the Hetzner firewall is active.
+</Warning>
+
+### UFW logs
+
+UFW logs blocked connections to syslog. View them with:
+
+```bash
+# Recent blocks
+sudo grep UFW /var/log/syslog | tail -20
+
+# Monitor in real-time
+sudo tail -f /var/log/syslog | grep UFW
+```
+
+Example log entry:
+```
+[UFW BLOCK] IN=eth0 OUT= SRC=198.51.100.42 DST=YOUR_VPS_IP LEN=40 PROTO=TCP DPT=22
+```
+
+<Tip>
+If you see excessive blocks from specific IPs, those are likely automated scanners. The firewall is working as intended.
+</Tip>
+
+## Hetzner Cloud Firewall
+
+Hetzner's network-level firewall operates at the hypervisor level, before packets reach your VPS.
+
+### Configuration steps
+
+1. **Navigate**: Hetzner Cloud Console → Firewalls → Create Firewall
+
+2. **Inbound rules**:
+   - **Rule 1**: Protocol: `UDP` | Port: `41641` | Source: `0.0.0.0/0, ::/0` | Comment: "Tailscale WireGuard"
+   - **Rule 2** (optional): Protocol: `ICMP` | Source: `0.0.0.0/0, ::/0` | Comment: "Ping/monitoring"
+
+3. **Outbound rules**: Leave default (allow all)
+
+4. **Apply**: Attach firewall to your VPS
+
+<Note>
+**The Hetzner firewall denies traffic by default.** Only the rules you explicitly create are allowed.
+</Note>
+
+### Recommended ruleset
+
+| Direction | Protocol | Port | Source/Dest | Purpose |
+|-----------|----------|------|-------------|----------|
+| Inbound | UDP | 41641 | `0.0.0.0/0, ::/0` | Tailscale WireGuard |
+| Inbound | ICMP | - | `0.0.0.0/0, ::/0` | Ping (optional) |
+| Outbound | All | All | `0.0.0.0/0, ::/0` | Allow all |
+
+<Accordion title="Why not allow SSH?">
+SSH is handled entirely through Tailscale. There's no need to expose SSH publicly:
+- The VPS is reachable via its Tailscale IP (`100.64.x.x`)
+- SSH is configured to reject non-Tailscale connections (`02_network.sh:68`)
+- This prevents SSH brute force attacks entirely
+</Accordion>
+
+<Accordion title="Why not allow HTTP/HTTPS?">
+Public web traffic flows through Cloudflare Tunnel:
+- The `cloudflared` daemon initiates an outbound HTTPS connection to Cloudflare
+- No inbound HTTP/HTTPS ports are needed
+- This provides DDoS protection and hides your origin IP
+</Accordion>
+
+### Verifying Hetzner firewall
+
+From an external machine (not on Tailscale):
+
+```bash
+# Test that ports are blocked
+nmap -Pn YOUR_VPS_PUBLIC_IP
+
+# Test specific ports
+nc -zv YOUR_VPS_PUBLIC_IP 22   # Should timeout or refuse
+nc -zv YOUR_VPS_PUBLIC_IP 80   # Should timeout or refuse
+nc -zv YOUR_VPS_PUBLIC_IP 443  # Should timeout or refuse
+```
+
+Expected: All TCP ports are filtered or closed.
+
+<Tip>
+Use `nmap -sU -p 41641 YOUR_VPS_PUBLIC_IP` to verify UDP 41641 is open (though nmap UDP scanning is unreliable).
+</Tip>
+
+## Docker and firewall interactions
+
+Docker bypasses UFW by directly manipulating iptables, which can create unexpected exposure.
+
+### The Docker problem
+
+When you publish a Docker port:
+
+```bash
+docker run -p 8080:80 nginx
+```
+
+Docker adds an iptables rule that **bypasses UFW entirely**:
+
+```bash
+-A DOCKER -p tcp -m tcp --dport 8080 -j ACCEPT
+```
+
+This means port 8080 is now accessible from `0.0.0.0`, regardless of UFW rules.
+
+<Warning>
+**Critical Docker security issue**: UFW will show `deny incoming`, but Docker ports are still exposed.
+</Warning>
+
+### How this project mitigates the issue
+
+1. **Hetzner Cloud Firewall**: Blocks all non-whitelisted traffic at the network level
+   - Even if Docker exposes ports, Hetzner firewall blocks them
+   - Defense in depth: UFW + Hetzner = double protection
+
+2. **No direct public access**: 
+   - SSH: Tailscale only
+   - Web traffic: Cloudflare Tunnel only
+   - Dokploy dashboard: Tailscale only (accessed via `http://100.64.x.x:3000`)
+
+3. **Docker Swarm considerations**:
+   - Dokploy uses Docker Swarm, which requires ports to bind to `0.0.0.0`
+   - This is a Swarm limitation, not a security choice
+   - The Hetzner firewall ensures these ports remain protected
+
+### Verifying Docker port exposure
+
+Check what Docker has exposed:
+
+```bash
+# List published ports
+sudo docker ps --format 'table {{.Names}}\t{{.Ports}}'
+
+# Check iptables DOCKER chain
+sudo iptables -t nat -L DOCKER -n --line-numbers
+
+# Verify ports are listening but blocked from outside
+sudo ss -tlnp | grep -E ':(80|443|3000)'
+```
+
+Example output:
+```
+STATE   RECV-Q   SEND-Q   Local Address:Port
+LISTEN  0        4096     0.0.0.0:80
+LISTEN  0        4096     0.0.0.0:443
+LISTEN  0        4096     0.0.0.0:3000
+```
+
+<Info>
+**0.0.0.0 binding is expected**. The Hetzner Cloud Firewall ensures these ports aren't reachable from the public internet.
+</Info>
+
+### Alternative: UFW-Docker script (not used)
+
+There's a community script to make UFW control Docker ports:
+https://github.com/chaifeng/ufw-docker
+
+This project **does not use it** because:
+- Adds complexity to the firewall configuration
+- Hetzner Cloud Firewall already provides network-level protection
+- Can interfere with Docker Swarm networking
+
+If you're deploying outside Hetzner, consider using ufw-docker or iptables rules.
+
+## Cloudflare firewall
+
+Cloudflare provides application-level protection for public traffic.
+
+### Features included (free tier)
+
+- **DDoS protection**: Automatic L3/L4 mitigation
+- **Rate limiting**: Basic rate limits on your zone
+- **Bot detection**: Challenge or block known bots
+- **IP blocking**: Block specific IPs or countries
+
+### Configuring Cloudflare firewall rules
+
+1. **Navigate**: Cloudflare dashboard → Your domain → Security → WAF
+
+2. **Create a firewall rule**:
+   ```
+   Field: Country
+   Operator: equals
+   Value: CN, RU
+   Action: Block
+   ```
+
+3. **Create rate limiting**:
+   ```
+   Field: Hostname
+   Operator: equals  
+   Value: dokploy.yourdomain.com
+   Requests: 100 requests per minute
+   Action: Challenge
+   ```
+
+<Tip>
+**Cloudflare Access** (paid tier) can add authentication:
+- Email OTP, Google, GitHub, Okta
+- Per-hostname policies
+- See [Cloudflare Tunnel docs](/deploy/cloudflare-tunnel#zero-trust-access)
+</Tip>
+
+### Cloudflare SSL/TLS mode
+
+Set to **Full** (not Full Strict) in `04_cloudflared.sh:39-42`:
+
+```
+Cloudflare dashboard → SSL/TLS → Full
+```
+
+| Mode | Behavior | Why not use? |
+|------|----------|-------------|
+| Off | No HTTPS | Insecure |
+| Flexible | HTTPS to edge, HTTP to origin | Exposes tunnel traffic |
+| **Full** | HTTPS to edge, encrypted tunnel | ✅ Used by this project |
+| Full (Strict) | Requires valid cert on origin | Traefik doesn't have a cert (Cloudflare terminates SSL) |
+
+## Firewall troubleshooting
+
+### Can't SSH via Tailscale
+
+```bash
+# On VPS: Check Tailscale is running
+sudo tailscale status
+
+# On VPS: Check SSH is listening
+sudo ss -tlnp | grep :22
+
+# On VPS: Check SSH config allows Tailscale
+sudo sshd -T | grep allowusers
+# Should output: allowusers *@100.64.0.0/10
+
+# On client: Verify you're using Tailscale IP
+ssh user@100.64.x.x  # NOT public IP
+```
+
+### Can't access Dokploy dashboard
+
+```bash
+# On VPS: Check Dokploy is running
+sudo docker service ls | grep dokploy
+
+# On VPS: Check port 3000 is listening
+sudo ss -tlnp | grep :3000
+
+# On client: Verify you're on Tailscale
+curl -I http://100.64.x.x:3000
+
+# On client: Check Tailscale connectivity
+tailscale ping 100.64.x.x
+```
+
+### Public domain not working
+
+```bash
+# On VPS: Check cloudflared is running
+sudo docker ps | grep cloudflared
+
+# On VPS: Check cloudflared logs
+sudo docker logs -f cloudflared
+# Look for: "Registered tunnel connection"
+
+# Check Cloudflare dashboard
+# Zero Trust → Networks → Tunnels → Your tunnel
+# Status should be "Healthy"
+
+# Check DNS
+dig dokploy.yourdomain.com
+# Should return Cloudflare IPs (not your VPS IP)
+
+# Check Cloudflare SSL mode
+# Dashboard → SSL/TLS → Should be "Full"
+```
+
+### UFW blocking wanted traffic
+
+```bash
+# Check UFW logs for blocks
+sudo grep UFW /var/log/syslog | tail -50
+
+# Identify blocked port
+# Example: [UFW BLOCK] ... DPT=8080
+
+# Add rule (example)
+sudo ufw allow from 100.64.0.0/10 to any port 8080
+
+# Reload UFW
+sudo ufw reload
+```
+
+<Warning>
+Before adding UFW rules, understand why the traffic is blocked. The default configuration is secure — only add exceptions when necessary.
+</Warning>
+
+## Security auditing
+
+### Run the verification script
+
+The deployment includes `05_verify.sh` for automated checks:
+
+```bash
+sudo bash ~/setup/05_verify.sh
+```
+
+This verifies:
+- Tailscale connectivity
+- SSH hardening
+- UFW configuration  
+- Dokploy health
+- Cloudflare Tunnel status
+
+### Manual firewall audit
+
+```bash
+# Check UFW status
+sudo ufw status verbose
+
+# List all iptables rules (verbose)
+sudo iptables -L -n -v
+sudo iptables -t nat -L -n -v
+
+# Check for unexpected listening ports
+sudo ss -tlnp
+
+# Review Hetzner firewall in Cloud Console
+# Ensure only UDP 41641 and ICMP are allowed inbound
+
+# Test from external machine
+nmap -Pn YOUR_VPS_PUBLIC_IP
+```
+
+<Tip>
+Schedule regular audits (monthly) to ensure firewall configuration hasn't drifted.
+</Tip>
+
+## Best practices
+
+### Do's
+
+- ✅ Keep Hetzner Cloud Firewall enabled at all times
+- ✅ Use UFW and Hetzner firewall together (defense in depth)
+- ✅ Review UFW logs periodically for unusual activity
+- ✅ Document any custom firewall rules you add
+- ✅ Test changes from an external machine before logging out
+- ✅ Keep emergency console access (Hetzner VNC) available
+
+### Don'ts  
+
+- ❌ Don't disable UFW to "fix" connectivity issues — investigate the root cause
+- ❌ Don't expose Docker ports directly to `0.0.0.0` without firewall protection
+- ❌ Don't open SSH to `0.0.0.0/0` — use Tailscale only
+- ❌ Don't delete the `tailscale0` UFW rule
+- ❌ Don't assume Docker respects UFW rules
+
+<Note>
+If you need to add custom rules, add them via UFW AND verify they're blocked by the Hetzner firewall if they shouldn't be public.
+</Note>

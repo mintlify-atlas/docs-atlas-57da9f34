@@ -1,0 +1,440 @@
+---
+title: Verification
+description: Verify zero-trust configuration and security hardening with automated checks
+---
+
+This guide covers `05_verify.sh`, which runs comprehensive checks to ensure your zero-trust Dokploy setup is properly configured and secure.
+
+## Prerequisites
+
+- All previous setup scripts completed
+- Server configured and running
+
+## Overview
+
+The verification script tests:
+
+- Tailscale connectivity
+- SSH hardening and restrictions
+- UFW firewall rules
+- Docker Swarm and Dokploy services
+- Cloudflare Tunnel health
+- Kernel security parameters
+- System configuration
+
+<Info>
+The script provides a pass/fail report for each check, highlighting any security misconfigurations.
+</Info>
+
+## Running the verification
+
+<Steps>
+
+<Step title="Execute the verification script">
+
+Run as root:
+
+```bash
+sudo bash ~/setup/05_verify.sh
+```
+
+The script displays your network configuration:
+
+```
+Public IP:    your.public.ip
+Tailscale IP: 100.x.y.z
+```
+
+</Step>
+
+<Step title="Review check results">
+
+The script performs checks in several categories. Each check shows:
+- ✓ **Pass** (green): Configuration is correct
+- ✗ **Fail** (red): Security issue detected
+- ! **Warn** (yellow): Non-critical issue or optional feature
+
+</Step>
+
+</Steps>
+
+## Check categories
+
+### Tailscale
+
+Verifies Tailscale VPN connectivity:
+
+```bash
+tailscale status &>/dev/null
+```
+
+**Expected result:**
+```
+[✓] Connected (100.x.y.z)
+```
+
+**If failed:**
+- Tailscale daemon not running: `sudo systemctl start tailscaled`
+- Not authenticated: Run `sudo tailscale up`
+- Key expired: Disable expiry in Tailscale admin panel
+
+### SSH hardening
+
+Checks SSH security configuration:
+
+```bash
+# Root login disabled
+sshd -T 2>/dev/null | grep -q "permitrootlogin no"
+
+# Password authentication disabled  
+sshd -T 2>/dev/null | grep -q "passwordauthentication no"
+
+# Tailscale-only restriction
+sshd -T 2>/dev/null | grep -q "100.64.0.0"
+```
+
+**Expected results:**
+```
+[✓] Root login disabled
+[✓] Password auth disabled
+[✓] Tailscale-only restriction
+```
+
+**If failed:**
+- Check `/etc/ssh/sshd_config.d/99-hardening.conf`
+- Verify `AllowUsers *@100.64.0.0/10` is present
+- Restart SSH: `sudo systemctl restart ssh`
+
+### UFW firewall
+
+Validates firewall rules:
+
+```bash
+# Firewall active
+ufw status | grep -q "Status: active"
+
+# Tailscale interface allowed
+ufw status | grep -q "tailscale0"
+
+# Public ports blocked
+ufw status | grep -q "80/tcp.*ALLOW.*Anywhere" && fail || pass
+ufw status | grep -q "443/tcp.*ALLOW.*Anywhere" && fail || pass
+```
+
+**Expected results:**
+```
+[✓] Active
+[✓] Tailscale interface allowed
+[✓] Port 80 not public
+[✓] Port 443 not public
+```
+
+**If failed:**
+- Activate UFW: `sudo ufw enable`
+- Allow Tailscale: `sudo ufw allow in on tailscale0`
+- Remove public rules: `sudo ufw delete allow 80/tcp`
+
+<Warning>
+If ports 80 or 443 show as publicly allowed, your Dokploy instance is exposed to the internet without Cloudflare Tunnel protection.
+</Warning>
+
+### Docker Swarm
+
+Verifies Docker Swarm is operational:
+
+```bash
+docker info 2>/dev/null | grep -q "Swarm: active"
+```
+
+**Expected result:**
+```
+[✓] Swarm active
+```
+
+**If failed:**
+- Initialize Swarm: `sudo docker swarm init`
+- Check Docker status: `sudo systemctl status docker`
+
+### Dokploy services
+
+Checks Dokploy components:
+
+```bash
+# Service running
+docker service ls 2>/dev/null | grep -q "dokploy"
+
+# Dashboard port
+ss -tlnp | grep -q ':3000'
+
+# Traefik reverse proxy
+ss -tlnp | grep -q ':80 '
+```
+
+**Expected results:**
+```
+[✓] Service running
+[✓] Dashboard on port 3000
+[✓] Traefik on port 80
+```
+
+**If failed:**
+- Check service status: `sudo docker service ls`
+- View logs: `sudo docker service logs dokploy`
+- Restart Dokploy: `sudo docker service update --force dokploy`
+
+### Cloudflare Tunnel
+
+Verifies cloudflared container:
+
+```bash
+docker ps 2>/dev/null | grep -q "cloudflared"
+```
+
+**Expected result:**
+```
+[✓] Container running
+```
+
+Or if not yet deployed:
+```
+[!] Not running (deploy via Script 4)
+```
+
+**If failed:**
+- Check container: `docker ps -a | grep cloudflared`
+- View logs: `docker logs cloudflared`
+- Restart: `docker restart cloudflared`
+
+### Kernel hardening
+
+Validates security parameters from [base system setup](/setup/base-system):
+
+```bash
+# SYN cookies (DDoS protection)
+[ "$(sysctl -n net.ipv4.tcp_syncookies)" = "1" ]
+
+# ASLR (Address Space Layout Randomization)
+[ "$(sysctl -n kernel.randomize_va_space)" = "2" ]
+
+# Kernel pointer restriction
+[ "$(sysctl -n kernel.kptr_restrict)" = "2" ]
+
+# Dmesg restriction
+[ "$(sysctl -n kernel.dmesg_restrict)" = "1" ]
+```
+
+**Expected results:**
+```
+[✓] SYN cookies
+[✓] ASLR
+[✓] kptr_restrict
+[✓] dmesg_restrict
+```
+
+**If failed:**
+- Reapply settings: `sudo sysctl -p /etc/sysctl.d/99-security.conf`
+- Verify file exists: `/etc/sysctl.d/99-security.conf`
+
+### Other system checks
+
+Miscellaneous configuration validation:
+
+```bash
+# Swap active
+swapon --show | grep -q '/swapfile'
+
+# Shared memory noexec
+mount | grep '/dev/shm' | grep -q 'noexec'
+
+# Automatic updates
+systemctl is-enabled unattended-upgrades
+```
+
+**Expected results:**
+```
+[✓] Swap active
+[✓] /dev/shm noexec
+[✓] Auto-updates
+```
+
+**If failed:**
+- Enable swap: `sudo swapon /swapfile`
+- Remount /dev/shm: `sudo mount -o remount /dev/shm`
+- Enable auto-updates: `sudo systemctl enable unattended-upgrades`
+
+## Summary report
+
+At the end, the script shows:
+
+```
+── Summary ──
+
+All checks passed.
+
+Don't forget the Hetzner Cloud Firewall (see README).
+```
+
+Or if there are failures:
+
+```
+── Summary ──
+
+3 check(s) failed.
+```
+
+<Note>
+A count of failures helps prioritize fixes. Address critical security issues (SSH, firewall) before proceeding.
+</Note>
+
+## Cleanup prompt
+
+After verification, the script offers to delete setup files:
+
+```
+Delete setup scripts from /home/deploy/setup? (yes/no):
+```
+
+Typing `yes` removes:
+- All setup scripts (`01_base.sh` through `05_verify.sh`)
+- Setup directory
+- Cloudflared compose file
+- Git repository metadata (if present)
+
+<Warning>
+Backup scripts before deletion if you plan to reuse them on other servers.
+</Warning>
+
+## Post-verification
+
+Once all checks pass:
+
+### Access your server
+
+**SSH via Tailscale:**
+```bash
+ssh deploy@100.x.y.z
+```
+
+**Public SSH should fail:**
+```bash
+ssh deploy@YOUR_PUBLIC_IP
+# Connection timed out (blocked by UFW)
+```
+
+### Access Dokploy
+
+**Admin dashboard (via Tailscale):**
+```
+http://100.x.y.z:3000
+```
+
+**Public access (via Cloudflare):**
+```
+https://dokploy.yourdomain.com
+```
+
+<Tip>
+Bookmark the Tailscale URL for admin access. Use the public URL for sharing with team members (after setting up Zero Trust access policies).
+</Tip>
+
+## Manual verification commands
+
+Run these commands to manually verify your setup:
+
+```bash
+# Network connectivity
+tailscale status
+curl -4 ifconfig.me  # Your public IP
+
+# Firewall status
+sudo ufw status verbose
+sudo iptables -L -n -v
+
+# SSH configuration
+sudo sshd -T | grep -E 'permitroot|passwordauth|allowusers'
+
+# Docker and Dokploy
+sudo docker info | grep Swarm
+sudo docker service ls
+sudo docker ps | grep cloudflared
+
+# Listening ports
+sudo ss -tlnp | grep -E ':22|:80|:443|:3000'
+
+# Kernel security
+sudo sysctl net.ipv4.tcp_syncookies
+sudo sysctl kernel.randomize_va_space
+
+# Mounts and swap
+mount | grep /dev/shm
+swapon --show
+```
+
+## Security checklist
+
+After passing all verification checks, confirm:
+
+- [ ] Tailscale connected and key expiry disabled
+- [ ] SSH only accessible via Tailscale (100.64.0.0/10)
+- [ ] Root SSH login disabled
+- [ ] UFW active with all public ports blocked
+- [ ] Hetzner Cloud Firewall configured (only UDP 41641 allowed)
+- [ ] Docker Swarm active
+- [ ] Dokploy dashboard accessible via Tailscale
+- [ ] Cloudflare Tunnel healthy
+- [ ] Dokploy accessible via public domain (if Cloudflare configured)
+- [ ] Kernel hardening applied
+- [ ] Automatic security updates enabled
+
+## Troubleshooting
+
+### Multiple failures
+
+If many checks fail, you likely skipped a setup script. Re-run them in order:
+
+```bash
+sudo bash ~/setup/01_base.sh
+sudo bash ~/setup/02_network.sh
+sudo bash ~/setup/03_dokploy.sh
+sudo bash ~/setup/04_cloudflared.sh
+sudo bash ~/setup/05_verify.sh
+```
+
+### Specific check failures
+
+Refer to the individual check sections above for resolution steps.
+
+### Script errors
+
+If the verification script itself fails:
+
+```bash
+# Check script permissions
+ls -la ~/setup/05_verify.sh
+
+# Run with explicit bash
+bash -x ~/setup/05_verify.sh  # Debug mode
+```
+
+## Files referenced
+
+The verification script checks these configuration files:
+
+| File | Checked For |
+|------|------------|
+| `/etc/ssh/sshd_config.d/99-hardening.conf` | SSH restrictions |
+| `/etc/sysctl.d/99-security.conf` | Kernel hardening |
+| `/etc/sysctl.d/99-swappiness.conf` | Swap tuning |
+| `/etc/fstab` | Swap and /dev/shm mount |
+| `/etc/ufw/user.rules` | Firewall rules |
+
+## Next steps
+
+With verification complete:
+
+1. **Set up Hetzner Cloud Firewall** (if not already done) — see [network lockdown guide](/setup/network-lockdown)
+2. **Configure Zero Trust access policies** for Dokploy dashboard
+3. **Deploy your first application** in Dokploy
+4. **Set up backups** for Dokploy volumes and data
+
+Your zero-trust Dokploy infrastructure is now ready for production use.

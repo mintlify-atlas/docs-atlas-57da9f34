@@ -1,0 +1,314 @@
+---
+title: Daily usage
+description: Common workflows and commands for managing your Hetzner Zero Trust VPS deployment platform
+---
+
+## Accessing your server
+
+### Dashboard access
+
+The Dokploy dashboard is protected by Cloudflare Zero Trust and accessible at:
+
+```
+https://dokploy.yourdomain.com
+```
+
+You'll be prompted for email authentication on first visit. Once authenticated, you can manage all deployments, services, and configurations through the web interface.
+
+### SSH access
+
+SSH is only available through Tailscale. Public SSH ports are never exposed.
+
+```bash
+ssh <user>@<tailscale-ip>
+```
+
+To find your Tailscale IP:
+
+```bash
+tailscale ip -4
+```
+
+<Info>
+All SSH access is restricted to your Tailscale network. The Hetzner Cloud Firewall blocks all public TCP traffic except Tailscale's WireGuard protocol (UDP 41641).
+</Info>
+
+## Managing services
+
+### Check service status
+
+View all running Docker Swarm services:
+
+```bash
+docker service ls
+```
+
+Expected output includes:
+- `dokploy` (main service)
+- `dokploy-postgres` (database)
+- `dokploy-redis` (cache)
+- Any deployed applications
+
+### View service logs
+
+For Dokploy core services:
+
+```bash
+# Main Dokploy service
+docker service logs dokploy
+
+# PostgreSQL database
+docker service logs dokploy-postgres
+
+# Redis cache
+docker service logs dokploy-redis
+```
+
+For cloudflared tunnel:
+
+```bash
+docker logs cloudflared
+```
+
+<Tip>
+Application logs are best viewed through the Dokploy dashboard under each service's Logs tab for real-time streaming and filtering.
+</Tip>
+
+### Restart services
+
+If a service becomes unresponsive:
+
+```bash
+# Restart Dokploy
+sudo docker service update --force dokploy
+
+# Restart cloudflared
+docker restart cloudflared
+```
+
+## System updates
+
+### Update system packages
+
+The base system has unattended-upgrades enabled for security patches. To manually update:
+
+```bash
+sudo apt update
+sudo apt upgrade -y
+```
+
+### Update Dokploy
+
+To update Dokploy to the latest version:
+
+```bash
+curl -sSL https://dokploy.com/install.sh | sh -s update
+```
+
+<Warning>
+After updating Dokploy, you may need to re-apply timezone settings to the core services if they were reset during the update process.
+</Warning>
+
+### Reapply timezone to services
+
+If services show incorrect timestamps after updates:
+
+```bash
+sudo docker service update --env-add TZ=Europe/Budapest dokploy
+sudo docker service update --env-add TZ=Europe/Budapest dokploy-postgres
+sudo docker service update --env-add TZ=Europe/Budapest dokploy-redis
+```
+
+Replace `Europe/Budapest` with your timezone.
+
+## Monitoring
+
+### Check listening ports
+
+Verify which ports are bound and listening:
+
+```bash
+ss -tlnp | grep -E ':3000|:80 |:443 '
+```
+
+Expected output:
+- Port `3000` - Dokploy dashboard
+- Port `80` - Traefik HTTP
+- Port `443` - Traefik HTTPS (if configured)
+
+<Note>
+Ports bind to `0.0.0.0` due to Docker Swarm limitations. The Hetzner Cloud Firewall blocks all public TCP access at the hypervisor level, so only Tailscale peers can reach these ports.
+</Note>
+
+### Verify Tailscale connection
+
+```bash
+tailscale status
+```
+
+Check your current Tailscale IP:
+
+```bash
+tailscale ip -4
+```
+
+### Check firewall status
+
+UFW (host-level firewall):
+
+```bash
+sudo ufw status verbose
+```
+
+Verify Tailscale interface is allowed and ports 80/443 are not publicly exposed.
+
+### Verify tunnel health
+
+Check if cloudflared is connected to Cloudflare:
+
+```bash
+docker logs cloudflared --tail 50
+```
+
+Look for connection confirmations and absence of errors. The tunnel should show as "healthy" in your Cloudflare dashboard.
+
+### Check Docker Swarm status
+
+```bash
+docker info | grep -A 5 "Swarm:"
+```
+
+Should show `Swarm: active`.
+
+## Backup considerations
+
+### Important directories
+
+| Path | Contents |
+|------|----------|
+| `/etc/dokploy/` | Dokploy configuration |
+| `/etc/dokploy/traefik/traefik.yml` | Traefik reverse proxy config |
+| `/var/lib/docker/volumes/` | Docker volumes (databases, app data) |
+| `/etc/ssh/sshd_config.d/99-hardening.conf` | SSH hardening config |
+| `/etc/sysctl.d/99-security.conf` | Kernel security settings |
+
+<Tip>
+For production deployments, implement regular backups of Docker volumes and the `/etc/dokploy/` directory. Consider using Hetzner's snapshot feature for full system backups.
+</Tip>
+
+### Application data
+
+Application databases and persistent data are stored in Docker volumes. List all volumes:
+
+```bash
+docker volume ls
+```
+
+Backup a specific volume:
+
+```bash
+docker run --rm -v VOLUME_NAME:/data -v $(pwd):/backup ubuntu tar czf /backup/volume-backup.tar.gz /data
+```
+
+## Security audits
+
+### Run verification script
+
+The setup includes a comprehensive verification script that checks all security configurations:
+
+```bash
+sudo bash ~/setup/05_verify.sh
+```
+
+<Info>
+This script is only available if you haven't deleted the setup scripts yet. It checks Tailscale, SSH hardening, UFW, Docker Swarm, Dokploy services, kernel hardening, and swap configuration.
+</Info>
+
+### Manual security checks
+
+Verify SSH hardening:
+
+```bash
+sudo sshd -T | grep -E "permitrootlogin|passwordauthentication|allowusers"
+```
+
+Expected output:
+- `permitrootlogin no`
+- `passwordauthentication no`
+- `allowusers` restricted to Tailscale network (100.64.0.0/10)
+
+Verify kernel hardening:
+
+```bash
+sysctl net.ipv4.tcp_syncookies
+sysctl kernel.randomize_va_space
+sysctl kernel.kptr_restrict
+```
+
+## Common workflows
+
+### Checking system resource usage
+
+```bash
+# CPU and memory
+htop
+
+# Disk usage
+df -h
+
+# Docker disk usage
+docker system df
+```
+
+### Cleaning up Docker resources
+
+Remove unused images and containers:
+
+```bash
+# Remove stopped containers
+docker container prune -f
+
+# Remove unused images
+docker image prune -a -f
+
+# Remove unused volumes (careful!)
+docker volume prune -f
+```
+
+<Warning>
+Be cautious with `docker volume prune` as it will delete all unused volumes, potentially including application data from stopped services.
+</Warning>
+
+### Viewing swap usage
+
+```bash
+swapon --show
+free -h
+```
+
+## Accessing internal services
+
+### Apps without public domains
+
+Applications deployed without a domain configured in Dokploy are not publicly reachable. Traefik has no routing rule for them, and all public TCP is blocked.
+
+These apps are only accessible via Tailscale:
+
+```
+http://<tailscale-ip>:<port>
+```
+
+<Info>
+This is useful for internal tools, admin panels, or development instances that should never be exposed to the public internet.
+</Info>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Deploying apps" icon="rocket" href="/operations/deploying-apps">
+    Learn how to deploy applications through Dokploy
+  </Card>
+  <Card title="Troubleshooting" icon="wrench" href="/operations/troubleshooting">
+    Common issues and solutions
+  </Card>
+</CardGroup>
