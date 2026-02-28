@@ -1,0 +1,70 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "Hetzner Zero Trust VPS",
+  "projectDescription": "Hardened Dokploy deployment on Hetzner with zero public ports, SSH via Tailscale, and traffic via Cloudflare Tunnel.",
+  "theme": "aspen",
+  "primaryColor": "#1e40af",
+  "lightColor": "#3b82f6",
+  "darkColor": "#1e3a8a",
+  "navigation": {
+    "groups": [
+      {
+        "group": "Overview",
+        "pages": [
+          "introduction",
+          "architecture",
+          "prerequisites"
+        ]
+      },
+      {
+        "group": "Setup Guide",
+        "pages": [
+          "setup/base-system",
+          "setup/network-lockdown",
+          "setup/dokploy-installation",
+          "setup/cloudflare-tunnel",
+          "setup/verification"
+        ]
+      },
+      {
+        "group": "Operations",
+        "pages": [
+          "operations/daily-usage",
+          "operations/deploying-apps",
+          "operations/troubleshooting"
+        ]
+      },
+      {
+        "group": "Security",
+        "pages": [
+          "security/hardening",
+          "security/zero-trust",
+          "security/firewall"
+        ]
+      },
+      {
+        "group": "Reference",
+        "pages": [
+          "reference/scripts",
+          "reference/design-notes",
+          "reference/file-locations"
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Zero public ports - all traffic via Cloudflare Tunnel",
+    "SSH access restricted to Tailscale network only",
+    "Cloudflare Zero Trust authentication for dashboard",
+    "Kernel-level security hardening",
+    "Hetzner Cloud Firewall integration",
+    "Automated Dokploy deployment with Docker Swarm"
+  ],
+  "publicApiSurface": [
+    "01_base.sh - System hardening and user creation",
+    "02_network.sh - Tailscale and SSH lockdown",
+    "03_dokploy.sh - Docker Swarm and Dokploy installation",
+    "04_cloudflared.sh - Cloudflare Tunnel setup",
+    "05_verify.sh - Security verification and cleanup"
+  ]
+}
